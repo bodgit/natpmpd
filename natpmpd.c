@@ -27,7 +27,6 @@ __dead void	 usage(void);
 struct natpmpd	 natpmpd_env;
 
 struct event blurt_ev;
-int s;
 int debugsyslog = 0;
 
 struct timeval timeouts[NATPMPD_MAX_DELAY] = {
@@ -44,9 +43,8 @@ struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 };
 
 /* Need external interface to track address changes and address to listen on */
-//#define ETHERNET_DEVICE "vic0"
-#define ETHERNET_DEVICE "lo0"
-#define LISTEN_ON "192.168.138.128"
+//#define ETHERNET_DEVICE "lo0"
+#define ETHERNET_DEVICE "carp0"
 
 /* __dead is for lint */
 __dead void
@@ -74,6 +72,8 @@ blurt_address(int fd, short event, void *arg)
 	u_int32_t sssoe;
 	struct ifreq ifr;
 	struct sockaddr_in *ifaddr;
+	struct listen_addr *la;
+	int s;
 
 	memset(&sock_w, 0, sizeof(sock_w));
 	sock_w.sin_family = AF_INET;
@@ -91,6 +91,9 @@ blurt_address(int fd, short event, void *arg)
 	memset(&ifr, 0, sizeof(struct ifreq));
 	strncpy(ifr.ifr_name, ETHERNET_DEVICE, IF_NAMESIZE);
 
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+		fatal("socket");
+
 	if (ioctl(s, SIOCGIFADDR, &ifr) == -1)
 		exit(1);
 
@@ -98,13 +101,15 @@ blurt_address(int fd, short event, void *arg)
 	fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", ETHERNET_DEVICE, inet_ntoa(ifaddr->sin_addr));
 	memcpy(&packet[8], &ifaddr->sin_addr.s_addr, 4);
 
-	if (sendto(s, packet, len, 0, (struct sockaddr *)&sock_w, sizeof(sock_w)) < 0) {
-		fprintf(stderr, "%d\n", errno);
-		return;
-	}
+	close(s);
 
-	/* Use INADDR_ALLHOSTS_GROUP:NATPMPD_CLIENT_PORT */
-	//fprintf(stderr, "Announcement #%d to %s:%d\n", env->sc_delay, inet_ntoa(ntohl(INADDR_ALLHOSTS_GROUP)), NATPMPD_CLIENT_PORT);
+	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
+
+		if (sendto(la->fd, packet, len, 0,
+		    (struct sockaddr *)&sock_w, sizeof(sock_w)) < 0)
+			log_warn("sendto");
+		la = TAILQ_NEXT(la, entry);
+	}
 
 	env->sc_delay++;
 
@@ -146,6 +151,12 @@ natpmp_recvmsg(int fd, short event, void *arg)
 	u_int8_t version;
 	u_int8_t opcode;
 	u_int16_t result;
+	u_int32_t sssoe;
+	struct timeval tv;
+	int s;
+	struct natpmpd *env = (struct natpmpd *)arg;
+	struct ifreq ifr;
+	struct sockaddr_in *ifaddr;
 
 	slen = sizeof(ss);
 	if ((len = recvfrom(fd, packet, sizeof(packet), 0,
@@ -172,19 +183,45 @@ natpmp_recvmsg(int fd, short event, void *arg)
 		packet[0] = NATPMPD_MAX_VERSION;
 		result = NATPMPD_BAD_VERSION;
 		len = 4;
+	} else if (opcode > 2) {
+		result = NATPMPD_BAD_OPCODE;
+		len = 4;
 	} else {
+		gettimeofday(&tv, NULL);
+		sssoe = htonl(tv.tv_sec - env->sc_starttime.tv_sec);
+
 		switch (opcode) {
 		case 0:
+			memset(&ifr, 0, sizeof(struct ifreq));
+			strncpy(ifr.ifr_name, ETHERNET_DEVICE, IF_NAMESIZE);
+
+			if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+				fatal("socket");
+
+			if (ioctl(s, SIOCGIFADDR, &ifr) == -1)
+				exit(1);
+
+			ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+			fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", ETHERNET_DEVICE, inet_ntoa(ifaddr->sin_addr));
+			memcpy(&packet[8], &ifaddr->sin_addr.s_addr, 4);
+
+			close(s);
+			len = 12;
 			break;
-		case 1: /* UDP */
-		case 2: /* TCP */
-			break;
-		default:
-			result = NATPMPD_BAD_OPCODE;
-			len = 4;
+		case 1: // UDP
+		case 2: // TCP
+			/* XXX Just copy the packet data and say not allowed */
+			memcpy(&packet[12], &packet[8], 4);
+			memcpy(&packet[8], &packet[4], 4);
+			result = NATPMPD_NOT_AUTHORISED;
+			len = 16;
 			break;
 		}
+
+		memcpy(&packet[4], &sssoe, sizeof(sssoe));
 	}
+
+	memcpy(&packet[2], &result, sizeof(result));
 	
 	len = sendto(fd, packet, len, 0, (struct sockaddr *)&ss, slen);
 }
@@ -210,6 +247,7 @@ main(int argc, char *argv[])
 	int rt_fd;
 	unsigned int rtfilter;
 	struct natpmpd *env;
+	struct listen_addr *la;
 
 	log_init(1);	/* log to stderr until daemonized */
 
@@ -242,31 +280,52 @@ main(int argc, char *argv[])
 	if ((env = parse_config(conffile, flags)) == NULL)
 		exit(1);
 
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_DGRAM;
+	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
+		switch (la->sa.ss_family) {
+		case AF_INET:
+			if (((struct sockaddr_in *)&la->sa)->sin_port == 0)
+				((struct sockaddr_in *)&la->sa)->sin_port =
+				    htons(NATPMPD_SERVER_PORT);
+			break;
+		case AF_INET6:
+		default:
+			fatalx("king bula sez: af borked");
+		}
 
-	if ((status = getaddrinfo(LISTEN_ON, NATPMPD_SERVER_PORT, &hints, &servinfo)) != 0 ) {
-		fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
-		exit(1);
+		log_info("listening on %s",
+		    log_sockaddr((struct sockaddr *)&la->sa));
+
+		if ((la->fd = socket(la->sa.ss_family, SOCK_DGRAM, 0)) == -1)
+			fatal("socket");
+
+		if (fcntl(la->fd, F_SETFL, O_NONBLOCK) == -1)
+			fatal("fcntl");
+
+		/* Without this I can't get the multicast announcements to
+		 * leave on the correct interface, especially with >1
+		 * interface
+		 */
+		if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_IF,
+		    &(((struct sockaddr_in *)&la->sa)->sin_addr),
+		    sizeof(struct in_addr)) == -1)
+			fatal("setsockopt");
+
+		if (bind(la->fd, (struct sockaddr *)&la->sa,
+		    SA_LEN((struct sockaddr *)&la->sa)) == -1) {
+			struct listen_addr	*nla;
+
+			log_warn("bind on %s failed, skipping",
+			    log_sockaddr((struct sockaddr *)&la->sa));
+			close(la->fd);
+			nla = TAILQ_NEXT(la, entry);
+			TAILQ_REMOVE(&env->listen_addrs, la, entry);
+			free(la);
+			la = nla;
+			continue;
+		}
+
+		la = TAILQ_NEXT(la, entry);
 	}
-
-	if ((s = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol)) == -1) {
-		fprintf(stderr, "socket error: %s\n", gai_strerror(errno));
-		exit(1);
-	}
-
-	if (fcntl(s, F_SETFL, O_NONBLOCK) == -1) {
-		fprintf(stderr, "fcntl error: %s\n", gai_strerror(errno));
-		exit(1);
-	}
-
-	if (bind(s, servinfo->ai_addr, servinfo->ai_addrlen) == -1) {
-		fprintf(stderr, "bind error: %s\n", gai_strerror(errno));
-		exit(1);
-	}
-
-	freeaddrinfo(servinfo);
 
 	if ((rt_fd = socket(PF_ROUTE, SOCK_RAW, 0)) < 0)
 		err(1, "no routing socket");
@@ -275,7 +334,6 @@ main(int argc, char *argv[])
 	setsockopt(rt_fd, PF_ROUTE, ROUTE_MSGFILTER,
 	    &rtfilter, sizeof(rtfilter));
 
-	env = &natpmpd_env;
 	env->sc_delay = 0;
 
 	log_init(debug);
@@ -286,8 +344,11 @@ main(int argc, char *argv[])
 
 	event_init();
 
-	event_set(&ev, s, EV_READ|EV_PERSIST, natpmp_recvmsg, env);
-	event_add(&ev, NULL);
+	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
+		event_set(&la->ev, la->fd, EV_READ|EV_PERSIST, natpmp_recvmsg, env);
+		event_add(&la->ev, NULL);
+		la = TAILQ_NEXT(la, entry);
+	}
 
 	event_set(&rt_ev, rt_fd, EV_READ|EV_PERSIST, rt_handler, env);
 	event_add(&rt_ev, NULL);

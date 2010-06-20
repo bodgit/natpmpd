@@ -1,3 +1,0 @@
-# Repeat for each internal network
-
-route add -net 224/4 -mpath -interface IP.OF.INTERNAL.INTERFACE

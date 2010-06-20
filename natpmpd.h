@@ -7,12 +7,13 @@
 
 #include <netinet/in.h>
 
+#include <event.h>
 #include <netdb.h>
 
 #define NATPMPD_USER		 "_natpmp"
 #define CONF_FILE		 "/etc/natpmpd.conf"
 
-#define NATPMPD_SERVER_PORT 	 "5351"
+#define NATPMPD_SERVER_PORT 	 5351
 #define NATPMPD_CLIENT_PORT	 5350
 
 #define NATPMPD_MAX_VERSION	 0
@@ -37,6 +38,7 @@ struct listen_addr {
 	TAILQ_ENTRY(listen_addr)	 entry;
 	struct sockaddr_storage		 sa;
 	int				 fd;
+	struct event			 ev;
 };
 
 struct ntp_addr {
