@@ -1,0 +1,588 @@
+%{
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/queue.h>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include <ctype.h>
+#include <errno.h>
+#include <event.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+
+#include "natpmpd.h"
+
+TAILQ_HEAD(files, file)		 files = TAILQ_HEAD_INITIALIZER(files);
+static struct file {
+	TAILQ_ENTRY(file)	 entry;
+	FILE			*stream;
+	char			*name;
+	int			 lineno;
+	int			 errors;
+} *file, *topfile;
+struct file	*pushfile(const char *);
+int		 popfile(void);
+int		 yyparse(void);
+int		 yylex(void);
+int		 yyerror(const char *, ...);
+int		 kw_cmp(const void *, const void *);
+int		 lookup(char *);
+int		 lgetc(int);
+int		 lungetc(int);
+int		 findeol(void);
+
+struct natpmpd			*conf;
+
+struct opts {
+	int		 weight;
+	int		 correction;
+	char		*refstr;
+} opts;
+void		 opts_default(void);
+
+typedef struct {
+	union {
+		int64_t			 number;
+		char			*string;
+		struct ntp_addr_wrap	*addr;
+		struct opts		 opts;
+	} v;
+	int lineno;
+} YYSTYPE;
+
+%}
+
+%token	LISTEN ON
+%token	ERROR
+%token	<v.string>		STRING
+%token	<v.number>		NUMBER
+%type	<v.addr>		address
+%%
+
+grammar		: /* empty */
+		| grammar '\n'
+		| grammar main '\n'
+		| grammar error '\n'		{ file->errors++; }
+		;
+
+main		: LISTEN ON address	{
+			struct listen_addr	*la;
+			struct ntp_addr		*h, *next;
+
+			if ((h = $3->a) == NULL &&
+			    (host_dns($3->name, &h) == -1 || !h)) {
+				yyerror("could not resolve \"%s\"", $3->name);
+				free($3->name);
+				free($3);
+				YYERROR;
+			}
+
+			for (; h != NULL; h = next) {
+				next = h->next;
+				if (h->ss.ss_family == AF_UNSPEC) {
+					conf->listen_all = 1;
+					free(h);
+					continue;
+				}
+				la = calloc(1, sizeof(struct listen_addr));
+				if (la == NULL)
+					fatal("listen on calloc");
+				la->fd = -1;
+				memcpy(&la->sa, &h->ss,
+				    sizeof(struct sockaddr_storage));
+				TAILQ_INSERT_TAIL(&conf->listen_addrs, la,
+				    entry);
+				free(h);
+			}
+			free($3->name);
+			free($3);
+		}
+		;
+
+address		: STRING		{
+			if (($$ = calloc(1, sizeof(struct ntp_addr_wrap))) ==
+			    NULL)
+				fatal(NULL);
+			if (host($1, &$$->a) == -1) {
+				yyerror("could not parse address spec \"%s\"",
+				    $1);
+				free($1);
+				free($$);
+				YYERROR;
+			}
+			$$->name = $1;
+		}
+		;
+
+%%
+
+struct keywords {
+	const char	*k_name;
+	int		 k_val;
+};
+
+int
+yyerror(const char *fmt, ...)
+{
+	va_list		 ap;
+	char		*nfmt;
+
+	file->errors++;
+	va_start(ap, fmt);
+	if (asprintf(&nfmt, "%s:%d: %s", file->name, yylval.lineno, fmt) == -1)
+		fatalx("yyerror asprintf");
+	vlog(LOG_CRIT, nfmt, ap);
+	va_end(ap);
+	free(nfmt);
+	return (0);
+}
+
+int
+kw_cmp(const void *k, const void *e)
+{
+	return (strcmp(k, ((const struct keywords *)e)->k_name));
+}
+
+int
+lookup(char *s)
+{
+	/* this has to be sorted always */
+	static const struct keywords keywords[] = {
+		{ "listen",		LISTEN },
+		{ "on",			ON }
+	};
+	const struct keywords	*p;
+
+	p = bsearch(s, keywords, sizeof(keywords)/sizeof(keywords[0]),
+	    sizeof(keywords[0]), kw_cmp);
+
+	if (p)
+		return (p->k_val);
+	else
+		return (STRING);
+}
+
+#define MAXPUSHBACK	128
+
+char	*parsebuf;
+int	 parseindex;
+char	 pushback_buffer[MAXPUSHBACK];
+int	 pushback_index = 0;
+
+int
+lgetc(int quotec)
+{
+	int		 c, next;
+
+	if (parsebuf) {
+		/* Read character from the parsebuffer instead of input. */
+		if (parseindex >= 0) {
+			c = parsebuf[parseindex++];
+			if (c != '\0')
+				return (c);
+			parsebuf = NULL;
+		} else
+			parseindex++;
+	}
+
+	if (pushback_index)
+		return (pushback_buffer[--pushback_index]);
+
+	if (quotec) {
+		if ((c = getc(file->stream)) == EOF) {
+			yyerror("reached end of file while parseing "
+			    "quoted string");
+			if (file == topfile || popfile() == EOF)
+				return (EOF);
+			return (quotec);
+		}
+		return (c);
+	}
+
+	while ((c = getc(file->stream)) == '\\') {
+		next = getc(file->stream);
+		if (next != '\n') {
+			c = next;
+			break;
+		}
+		yylval.lineno = file->lineno;
+		file->lineno++;
+	}
+
+	while (c == EOF) {
+		if (file == topfile || popfile() == EOF)
+			return (EOF);
+		c = getc(file->stream);
+	}
+	return (c);
+}
+
+int
+lungetc(int c)
+{
+	if (c == EOF)
+		return (EOF);
+	if (parsebuf) {
+		parseindex--;
+		if (parseindex >= 0)
+			return (c);
+	}
+	if (pushback_index < MAXPUSHBACK-1)
+		return (pushback_buffer[pushback_index++] = c);
+	else
+		return (EOF);
+}
+
+int
+findeol(void)
+{
+	int	 c;
+
+	parsebuf = NULL;
+
+	/* skip to either EOF or the first real EOL */
+	while (1) {
+		if (pushback_index)
+			c = pushback_buffer[--pushback_index];
+		else
+			c = lgetc(0);
+		if (c == '\n') {
+			file->lineno++;
+			break;
+		}
+		if (c == EOF)
+			break;
+	}
+	return (ERROR);
+}
+
+int
+yylex(void)
+{
+
+	char	 buf[8096];
+	char 	*p;
+	int	 quotec, next, c;
+	int	 token;
+
+	p = buf;
+	while ((c = lgetc(0)) == ' ' || c == '\t')
+		; /* nothing */
+
+	yylval.lineno = file->lineno;
+	if (c == '#')
+		while ((c = lgetc(0)) != '\n' && c != EOF)
+			; /* nothing */
+
+	switch (c) {
+	case '\'':
+	case '"':
+		quotec = c;
+		while (1) {
+			if ((c = lgetc(quotec)) == EOF)
+				return (0);
+			if (c == '\n') {
+				file->lineno++;
+				continue;
+			} else if (c == '\\') {
+				if ((next = lgetc(quotec)) == EOF)
+					return (0);
+				if (next == quotec || c == ' ' || c == '\t')
+					c = next;
+				else if (next == '\n')
+					continue;
+				else
+					lungetc(next);
+			} else if (c == quotec) {
+				*p = '\0';
+				break;
+			}
+			if (p + 1 >= buf + sizeof(buf) - 1) {
+				yyerror("string too long");
+				return (findeol());
+			}
+			*p++ = (char)c;
+		}
+		yylval.v.string = strdup(buf);
+		if (yylval.v.string == NULL)
+			fatal("yylex: strdup");
+		return (STRING);
+	}
+
+#define allowed_to_end_number(x) \
+	(isspace(x) || x == ')' || x == ',' || x == '/' || x == '}' || x == '=')
+
+	if (c == '-' || isdigit(c)) {
+		do {
+			*p++ = c;
+			if ((unsigned)(p-buf) >= sizeof(buf)) {
+				yyerror("string too long");
+				return (findeol());
+			}
+		} while ((c = lgetc(0)) != EOF && isdigit(c));
+		lungetc(c);
+		if (p == buf + 1 && buf[0] == '-')
+			goto nodigits;
+		if (c == EOF || allowed_to_end_number(c)) {
+			const char *errstr = NULL;
+
+			*p = '\0';
+			yylval.v.number = strtonum(buf, LLONG_MIN,
+			    LLONG_MAX, &errstr);
+			if (errstr) {
+				yyerror("\"%s\" invalid number: %s",
+				    buf, errstr);
+				return (findeol());
+			}
+			return (NUMBER);
+		} else {
+nodigits:
+			while (p > buf + 1)
+				lungetc(*--p);
+			c = *--p;
+			if (c == '-')
+				return (c);
+		}
+	}
+
+#define allowed_in_string(x) \
+	(isalnum(x) || (ispunct(x) && x != '(' && x != ')' && \
+	x != '{' && x != '}' && x != '<' && x != '>' && \
+	x != '!' && x != '=' && x != '/' && x != '#' && \
+	x != ','))
+
+	if (isalnum(c) || c == ':' || c == '_' || c == '*') {
+		do {
+			*p++ = c;
+			if ((unsigned)(p-buf) >= sizeof(buf)) {
+				yyerror("string too long");
+				return (findeol());
+			}
+		} while ((c = lgetc(0)) != EOF && (allowed_in_string(c)));
+		lungetc(c);
+		*p = '\0';
+		if ((token = lookup(buf)) == STRING)
+			if ((yylval.v.string = strdup(buf)) == NULL)
+				fatal("yylex: strdup");
+		return (token);
+	}
+	if (c == '\n') {
+		yylval.lineno = file->lineno;
+		file->lineno++;
+	}
+	if (c == EOF)
+		return (0);
+	return (c);
+}
+
+struct file *
+pushfile(const char *name)
+{
+	struct file	*nfile;
+
+	if ((nfile = calloc(1, sizeof(struct file))) == NULL) {
+		log_warn("malloc");
+		return (NULL);
+	}
+	if ((nfile->name = strdup(name)) == NULL) {
+		log_warn("malloc");
+		free(nfile);
+		return (NULL);
+	}
+	if ((nfile->stream = fopen(nfile->name, "r")) == NULL) {
+		log_warn("%s", nfile->name);
+		free(nfile->name);
+		free(nfile);
+		return (NULL);
+	}
+	nfile->lineno = 1;
+	TAILQ_INSERT_TAIL(&files, nfile, entry);
+	return (nfile);
+}
+
+int
+popfile(void)
+{
+	struct file	*prev;
+
+	if ((prev = TAILQ_PREV(file, files, entry)) != NULL)
+		prev->errors += file->errors;
+
+	TAILQ_REMOVE(&files, file, entry);
+	fclose(file->stream);
+	free(file->name);
+	free(file);
+	file = prev;
+	return (file ? 0 : EOF);
+}
+
+struct natpmpd *
+parse_config(const char *filename, u_int flags)
+{
+	int		 errors = 0;
+
+	if ((conf = calloc(1, sizeof(*conf))) == NULL) {
+		log_warn("cannot allocate memory");
+		return (NULL);
+	}
+
+	conf->sc_flags = flags;
+	conf->sc_confpath = filename;
+
+	TAILQ_INIT(&conf->listen_addrs);
+
+	if ((file = pushfile(filename)) == NULL) {
+		free(conf);
+		return (NULL);
+	}
+	topfile = file;
+
+	yyparse();
+	errors = file->errors;
+	popfile();
+
+	if (errors) {
+		free(conf);
+		return (NULL);
+	}
+
+	return (conf);
+}
+
+/* C&P */
+
+struct ntp_addr	*host_v4(const char *);
+struct ntp_addr	*host_v6(const char *);
+
+int
+host(const char *s, struct ntp_addr **hn)
+{
+	struct ntp_addr	*h = NULL;
+
+	if (!strcmp(s, "*"))
+		if ((h = calloc(1, sizeof(struct ntp_addr))) == NULL)
+			fatal(NULL);
+
+	/* IPv4 address? */
+	if (h == NULL)
+		h = host_v4(s);
+
+	/* IPv6 address? */
+	if (h == NULL)
+		h = host_v6(s);
+
+	if (h == NULL)
+		return (0);
+
+	*hn = h;
+
+	return (1);
+}
+
+struct ntp_addr	*
+host_v4(const char *s)
+{
+	struct in_addr		 ina;
+	struct sockaddr_in	*sa_in;
+	struct ntp_addr		*h;
+
+	bzero(&ina, sizeof(struct in_addr));
+	if (inet_pton(AF_INET, s, &ina) != 1)
+		return (NULL);
+
+	if ((h = calloc(1, sizeof(struct ntp_addr))) == NULL)
+		fatal(NULL);
+	sa_in = (struct sockaddr_in *)&h->ss;
+	sa_in->sin_len = sizeof(struct sockaddr_in);
+	sa_in->sin_family = AF_INET;
+	sa_in->sin_addr.s_addr = ina.s_addr;
+
+	return (h);
+}
+
+struct ntp_addr	*
+host_v6(const char *s)
+{
+	struct addrinfo		 hints, *res;
+	struct sockaddr_in6	*sa_in6;
+	struct ntp_addr		*h = NULL;
+
+	bzero(&hints, sizeof(hints));
+	hints.ai_family = AF_INET6;
+	hints.ai_socktype = SOCK_DGRAM; /*dummy*/
+	hints.ai_flags = AI_NUMERICHOST;
+	if (getaddrinfo(s, "0", &hints, &res) == 0) {
+		if ((h = calloc(1, sizeof(struct ntp_addr))) == NULL)
+			fatal(NULL);
+		sa_in6 = (struct sockaddr_in6 *)&h->ss;
+		sa_in6->sin6_len = sizeof(struct sockaddr_in6);
+		sa_in6->sin6_family = AF_INET6;
+		memcpy(&sa_in6->sin6_addr,
+		    &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
+		    sizeof(sa_in6->sin6_addr));
+		sa_in6->sin6_scope_id =
+		    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
+
+		freeaddrinfo(res);
+	}
+
+	return (h);
+}
+
+#define MAX_SERVERS_DNS 8
+
+int
+host_dns(const char *s, struct ntp_addr **hn)
+{
+	struct addrinfo		 hints, *res0, *res;
+	int			 error, cnt = 0;
+	struct sockaddr_in	*sa_in;
+	struct sockaddr_in6	*sa_in6;
+	struct ntp_addr		*h, *hh = NULL;
+
+	bzero(&hints, sizeof(hints));
+	hints.ai_family = PF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM; /* DUMMY */
+	error = getaddrinfo(s, NULL, &hints, &res0);
+	if (error == EAI_AGAIN || error == EAI_NODATA || error == EAI_NONAME)
+			return (0);
+	if (error) {
+		log_warnx("could not parse \"%s\": %s", s,
+		    gai_strerror(error));
+		return (-1);
+	}
+
+	for (res = res0; res && cnt < MAX_SERVERS_DNS; res = res->ai_next) {
+		if (res->ai_family != AF_INET &&
+		    res->ai_family != AF_INET6)
+			continue;
+		if ((h = calloc(1, sizeof(struct ntp_addr))) == NULL)
+			fatal(NULL);
+		h->ss.ss_family = res->ai_family;
+		if (res->ai_family == AF_INET) {
+			sa_in = (struct sockaddr_in *)&h->ss;
+			sa_in->sin_len = sizeof(struct sockaddr_in);
+			sa_in->sin_addr.s_addr = ((struct sockaddr_in *)
+			    res->ai_addr)->sin_addr.s_addr;
+		} else {
+			sa_in6 = (struct sockaddr_in6 *)&h->ss;
+			sa_in6->sin6_len = sizeof(struct sockaddr_in6);
+			memcpy(&sa_in6->sin6_addr, &((struct sockaddr_in6 *)
+			    res->ai_addr)->sin6_addr, sizeof(struct in6_addr));
+		}
+
+		h->next = hh;
+		hh = h;
+		cnt++;
+	}
+	freeaddrinfo(res0);
+
+	*hn = hh;
+	return (cnt);
+}
