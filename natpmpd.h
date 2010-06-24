@@ -7,6 +7,8 @@
 
 #include <netinet/in.h>
 
+#include <net/if.h>
+
 #include <event.h>
 #include <netdb.h>
 
@@ -60,7 +62,7 @@ struct natpmpd {
 	struct address		 sc_address;
 	TAILQ_HEAD(listen_addrs, listen_addr)		 listen_addrs;
 	u_int8_t					 listen_all;
-	const char		*sc_interface;
+	const char		 sc_interface[IF_NAMESIZE];
 	struct timeval		 sc_starttime;
 	int			 sc_delay;
 };

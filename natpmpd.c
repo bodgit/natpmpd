@@ -42,10 +42,6 @@ struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{ 64,      0 },
 };
 
-/* Need external interface to track address changes and address to listen on */
-//#define ETHERNET_DEVICE "lo0"
-#define ETHERNET_DEVICE "carp0"
-
 /* __dead is for lint */
 __dead void
 usage(void)
@@ -89,7 +85,7 @@ blurt_address(int fd, short event, void *arg)
 	memcpy(&packet[4], &sssoe, sizeof(sssoe));
 
 	memset(&ifr, 0, sizeof(struct ifreq));
-	strncpy(ifr.ifr_name, ETHERNET_DEVICE, IF_NAMESIZE);
+	strncpy(ifr.ifr_name, env->sc_interface, IF_NAMESIZE);
 
 	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
 		fatal("socket");
@@ -98,7 +94,7 @@ blurt_address(int fd, short event, void *arg)
 		exit(1);
 
 	ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
-	fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", ETHERNET_DEVICE, inet_ntoa(ifaddr->sin_addr));
+	fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", env->sc_interface, inet_ntoa(ifaddr->sin_addr));
 	memcpy(&packet[8], &ifaddr->sin_addr.s_addr, 4);
 
 	close(s);
@@ -193,7 +189,7 @@ natpmp_recvmsg(int fd, short event, void *arg)
 		switch (opcode) {
 		case 0:
 			memset(&ifr, 0, sizeof(struct ifreq));
-			strncpy(ifr.ifr_name, ETHERNET_DEVICE, IF_NAMESIZE);
+			strncpy(ifr.ifr_name, env->sc_interface, IF_NAMESIZE);
 
 			if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
 				fatal("socket");
@@ -202,7 +198,7 @@ natpmp_recvmsg(int fd, short event, void *arg)
 				exit(1);
 
 			ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
-			fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", ETHERNET_DEVICE, inet_ntoa(ifaddr->sin_addr));
+			fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", env->sc_interface, inet_ntoa(ifaddr->sin_addr));
 			memcpy(&packet[8], &ifaddr->sin_addr.s_addr, 4);
 
 			close(s);

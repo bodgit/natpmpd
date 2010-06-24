@@ -4,6 +4,7 @@
 #include <sys/queue.h>
 
 #include <netinet/in.h>
+
 #include <arpa/inet.h>
 
 #include <ctype.h>
@@ -59,6 +60,7 @@ typedef struct {
 %}
 
 %token	LISTEN ON
+%token	INTERFACE
 %token	ERROR
 %token	<v.string>		STRING
 %token	<v.number>		NUMBER
@@ -102,6 +104,16 @@ main		: LISTEN ON address	{
 			}
 			free($3->name);
 			free($3);
+		}
+		| INTERFACE STRING {
+			if (strlcpy(conf->sc_interface, $2,
+			    sizeof(conf->sc_interface)) >=
+			    sizeof(conf->sc_interface)) {
+				yyerror("interface name too long");
+				free($2);
+				YYERROR;
+			}
+			free($2);
 		}
 		;
 
@@ -154,6 +166,7 @@ lookup(char *s)
 {
 	/* this has to be sorted always */
 	static const struct keywords keywords[] = {
+		{ "interface",		INTERFACE },
 		{ "listen",		LISTEN },
 		{ "on",			ON }
 	};
