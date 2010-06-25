@@ -59,12 +59,13 @@ struct natpmpd {
 #define NATPMPD_F_VERBOSE	 0x01;
 
 	const char		*sc_confpath;
-	struct address		 sc_address;
+	in_addr_t		 sc_address;
 	TAILQ_HEAD(listen_addrs, listen_addr)		 listen_addrs;
 	u_int8_t					 listen_all;
-	const char		 sc_interface[IF_NAMESIZE];
+	char		 	 sc_interface[IF_NAMESIZE];
 	struct timeval		 sc_starttime;
 	int			 sc_delay;
+	struct event		 sc_announce_ev;
 };
 
 /* prototypes */

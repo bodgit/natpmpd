@@ -6,6 +6,7 @@
 
 #include <net/if.h>
 #include <net/route.h>
+#include <net/pfvar.h>
 
 #include <arpa/inet.h>
 
@@ -23,11 +24,14 @@
 #include "natpmpd.h"
 
 __dead void	 usage(void);
+void		 announce_address(int, short, void *);
+void		 check_interface(struct natpmpd *);
 
 struct natpmpd	 natpmpd_env;
 
-struct event blurt_ev;
 int debugsyslog = 0;
+
+int dev;
 
 struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{  0,      0 },
@@ -52,24 +56,21 @@ usage(void)
 	exit(1);
 }
 
-void
+/*void
 natpmp_parse(struct sockaddr_storage *ss)
 {
-}
+}*/
 
 void
-blurt_address(int fd, short event, void *arg)
+announce_address(int fd, short event, void *arg)
 {
-	struct natpmpd *env = (struct natpmpd *)arg;
-	struct sockaddr_in sock_w;
-	u_int8_t packet[NATPMPD_MAX_PACKET_SIZE];
-	ssize_t len;
-	struct timeval tv;
-	u_int32_t sssoe;
-	struct ifreq ifr;
-	struct sockaddr_in *ifaddr;
-	struct listen_addr *la;
-	int s;
+	struct natpmpd		*env = (struct natpmpd *)arg;
+	struct sockaddr_in	 sock_w;
+	u_int8_t		 packet[NATPMPD_MAX_PACKET_SIZE];
+	ssize_t			 len;
+	struct timeval		 tv;
+	u_int32_t		 sssoe;
+	struct listen_addr	*la;
 
 	memset(&sock_w, 0, sizeof(sock_w));
 	sock_w.sin_family = AF_INET;
@@ -83,24 +84,9 @@ blurt_address(int fd, short event, void *arg)
 	gettimeofday(&tv, NULL);
 	sssoe = htonl(tv.tv_sec - env->sc_starttime.tv_sec);
 	memcpy(&packet[4], &sssoe, sizeof(sssoe));
-
-	memset(&ifr, 0, sizeof(struct ifreq));
-	strncpy(ifr.ifr_name, env->sc_interface, IF_NAMESIZE);
-
-	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
-		fatal("socket");
-
-	if (ioctl(s, SIOCGIFADDR, &ifr) == -1)
-		exit(1);
-
-	ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
-	fprintf(stderr, "According to SIOCGIFADDR device %s has IP %s\n", env->sc_interface, inet_ntoa(ifaddr->sin_addr));
-	memcpy(&packet[8], &ifaddr->sin_addr.s_addr, 4);
-
-	close(s);
+	memcpy(&packet[8], &env->sc_address, 4);
 
 	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
-
 		if (sendto(la->fd, packet, len, 0,
 		    (struct sockaddr *)&sock_w, sizeof(sock_w)) < 0)
 			log_warn("sendto");
@@ -110,36 +96,31 @@ blurt_address(int fd, short event, void *arg)
 	env->sc_delay++;
 
 	if (env->sc_delay < NATPMPD_MAX_DELAY)
-		evtimer_add(&blurt_ev, &timeouts[env->sc_delay]);
+		evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
 }
 
 void
 rt_handler(int fd, short event, void *arg)
 {
-	char msg[2048];
-	struct rt_msghdr *rtm = (struct rt_msghdr *)&msg;
-	struct if_msghdr ifm;
-	ssize_t len;
-
-	fprintf(stderr, "Routing whoop\n");
+	struct natpmpd		*env = (struct natpmpd *)arg;
+	char			 msg[2048];
+	struct rt_msghdr	*rtm = (struct rt_msghdr *)&msg;
+	ssize_t			 len;
 
 	len = read(fd, msg, sizeof(msg));
 
-	if (len < (ssize_t)sizeof(struct rt_msghdr))
-		return;
-
 	if (rtm->rtm_version != RTM_VERSION)
 		return;
-
-	if (rtm->rtm_type != RTM_IFINFO)
+	if (rtm->rtm_type != RTM_NEWADDR)
 		return;
 
-	memcpy(&ifm, rtm, sizeof(ifm));
+	check_interface(env);
 }
 
 void
 natpmp_recvmsg(int fd, short event, void *arg)
 {
+	struct natpmpd *env = (struct natpmpd *)arg;
 	struct sockaddr_storage ss;
 	u_int8_t packet[NATPMPD_MAX_PACKET_SIZE];
 	socklen_t slen;
@@ -150,7 +131,6 @@ natpmp_recvmsg(int fd, short event, void *arg)
 	u_int32_t sssoe;
 	struct timeval tv;
 	int s;
-	struct natpmpd *env = (struct natpmpd *)arg;
 	struct ifreq ifr;
 	struct sockaddr_in *ifaddr;
 
@@ -158,8 +138,6 @@ natpmp_recvmsg(int fd, short event, void *arg)
 	if ((len = recvfrom(fd, packet, sizeof(packet), 0,
 	    (struct sockaddr *)&ss, &slen)) < 1 )
 		return;
-
-	fprintf(stderr, "Whoop, received %d byte(s)\n", (int)len);
 
 	/* Need at least 2 bytes to be able to do anything useful */
 	if (len < 2)
@@ -222,10 +200,41 @@ natpmp_recvmsg(int fd, short event, void *arg)
 	len = sendto(fd, packet, len, 0, (struct sockaddr *)&ss, slen);
 }
 
-/*int
-natpmp_bind(struct address *addr)
+void
+check_interface(struct natpmpd *env)
 {
-}*/
+	struct sockaddr_in	*ifaddr;
+	struct ifreq		 ifr;
+	int			 s;
+
+	memset(&ifr, 0, sizeof(struct ifreq));
+	strncpy(ifr.ifr_name, env->sc_interface, IF_NAMESIZE);
+
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+		fatal("socket");
+
+	if (ioctl(s, SIOCGIFADDR, &ifr) == -1)
+		fatal("ioctl");
+
+	close(s);
+
+	if (ifr.ifr_addr.sa_family != AF_INET)
+		return;
+	ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+
+	/* Primary address hasn't changed */
+	if (env->sc_address == ifaddr->sin_addr.s_addr)
+		return;
+
+	/* If the address changed again while we were still announcing the
+	 * old one, cancel the pending announcement before starting again
+	 */
+	if (evtimer_pending(&env->sc_announce_ev, NULL))
+		evtimer_del(&env->sc_announce_ev);
+	env->sc_address = ifaddr->sin_addr.s_addr;
+	env->sc_delay = 0;
+	evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
+}
 
 int
 main(int argc, char *argv[])
@@ -235,15 +244,14 @@ main(int argc, char *argv[])
 	int			 noaction = 0;
 	const char		*conffile = CONF_FILE;
 	u_int			 flags = 0;
+	unsigned char		 loop = 0;
 
-	int status;
-	struct addrinfo hints;
-	struct addrinfo *servinfo;
-	struct event ev, rt_ev;
+	struct event rt_ev;
 	int rt_fd;
 	unsigned int rtfilter;
 	struct natpmpd *env;
 	struct listen_addr *la;
+	struct pf_status status;
 
 	log_init(1);	/* log to stderr until daemonized */
 
@@ -276,6 +284,15 @@ main(int argc, char *argv[])
 	if ((env = parse_config(conffile, flags)) == NULL)
 		exit(1);
 
+	/* XXX Check for an interface and at least one address to listen on */
+
+	if ((dev = open("/dev/pf", O_RDWR)) == -1)
+		fatal("open /dev/pf");
+	if (ioctl(dev, DIOCGETSTATUS, &status) == -1)
+		fatal("DIOCGETSTATUS");
+	if (!status.running)
+		fatalx("pf is disabled");
+
 	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
 		switch (la->sa.ss_family) {
 		case AF_INET:
@@ -297,13 +314,13 @@ main(int argc, char *argv[])
 		if (fcntl(la->fd, F_SETFL, O_NONBLOCK) == -1)
 			fatal("fcntl");
 
-		/* Without this I can't get the multicast announcements to
-		 * leave on the correct interface, especially with >1
-		 * interface
-		 */
 		if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_IF,
 		    &(((struct sockaddr_in *)&la->sa)->sin_addr),
 		    sizeof(struct in_addr)) == -1)
+			fatal("setsockopt");
+
+		if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_LOOP,
+		    &loop, sizeof(loop)) == -1)
 			fatal("setsockopt");
 
 		if (bind(la->fd, (struct sockaddr *)&la->sa,
@@ -324,13 +341,13 @@ main(int argc, char *argv[])
 	}
 
 	if ((rt_fd = socket(PF_ROUTE, SOCK_RAW, 0)) < 0)
-		err(1, "no routing socket");
+		fatal("socket");
 
-	rtfilter = ROUTE_FILTER(RTM_IFINFO);
-	setsockopt(rt_fd, PF_ROUTE, ROUTE_MSGFILTER,
-	    &rtfilter, sizeof(rtfilter));
-
-	env->sc_delay = 0;
+	/* Hopefully this is enough? */
+	rtfilter = ROUTE_FILTER(RTM_NEWADDR);
+	if (setsockopt(rt_fd, PF_ROUTE, ROUTE_MSGFILTER,
+	    &rtfilter, sizeof(rtfilter)) == -1)
+		fatal("setsockopt");
 
 	log_init(debug);
 
@@ -349,8 +366,10 @@ main(int argc, char *argv[])
 	event_set(&rt_ev, rt_fd, EV_READ|EV_PERSIST, rt_handler, env);
 	event_add(&rt_ev, NULL);
 
-	evtimer_set(&blurt_ev, blurt_address, env);
-	evtimer_add(&blurt_ev, &timeouts[0]);
+	//env->sc_delay = 0;
+
+	evtimer_set(&env->sc_announce_ev, announce_address, env);
+	check_interface(env);
 
 	event_dispatch();
 
