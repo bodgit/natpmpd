@@ -18,6 +18,8 @@
 #define NATPMPD_SERVER_PORT 	 5351
 #define NATPMPD_CLIENT_PORT	 5350
 
+#define NATPMPD_ANCHOR		 "natpmpd"
+
 #define NATPMPD_MAX_VERSION	 0
 
 #define NATPMPD_SUCCESS		 0
@@ -59,13 +61,14 @@ struct natpmpd {
 #define NATPMPD_F_VERBOSE	 0x01;
 
 	const char		*sc_confpath;
-	in_addr_t		 sc_address;
+	struct in_addr		 sc_address;
 	TAILQ_HEAD(listen_addrs, listen_addr)		 listen_addrs;
 	u_int8_t					 listen_all;
 	char		 	 sc_interface[IF_NAMESIZE];
 	struct timeval		 sc_starttime;
 	int			 sc_delay;
 	struct event		 sc_announce_ev;
+	struct event		 sc_expire_ev;
 };
 
 /* prototypes */
@@ -82,5 +85,13 @@ const char *	 log_sockaddr(struct sockaddr *);
 
 /* parse.y */
 struct natpmpd	*parse_config(const char *, u_int);
+
+/* filter.c */
+void		 init_filter(char *, char *, int);
+int		 prepare_commit(void);
+int		 add_rdr(u_int8_t, struct sockaddr *, struct sockaddr *);
+int		 do_commit(void);
+int		 do_rollback(void);
+void		 expire_rules(int, short, void *);
 
 #endif

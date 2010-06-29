@@ -1,5 +1,5 @@
 PROG=	natpmpd
-SRCS=	natpmpd.c log.c parse.y
+SRCS=	natpmpd.c log.c parse.y filter.c
 CFLAGS+= -Wall -I${.CURDIR}
 CFLAGS+= -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+= -Wmissing-declarations
