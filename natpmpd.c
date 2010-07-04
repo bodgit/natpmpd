@@ -20,17 +20,28 @@
 #include <string.h>
 #include <err.h>
 #include <unistd.h>
+#include <assert.h>
 
 #include "natpmpd.h"
 
 __dead void	 usage(void);
+struct mapping	*init_mapping(void);
+void		 expire_mapping(int, short, void *);
 void		 announce_address(int, short, void *);
+void		 route_handler(int, short, void *);
+int		 natpmp_remove_mapping(u_int8_t, struct sockaddr_in *);
+int		 natpmp_create_mapping(u_int8_t, struct sockaddr_in *,
+		     struct sockaddr_in *, u_int32_t);
+ssize_t		 natpmp_mapping(u_int8_t *, u_int8_t, struct sockaddr_in *,
+		     struct sockaddr_in *, u_int32_t, struct natpmpd *);
+void		 natpmp_handler(int, short, void *);
 void		 check_interface(struct natpmpd *);
 int		 rebuild_rules(void);
+u_int32_t	 sssoe(struct natpmpd *);
+ssize_t		 natpmp_address_packet(u_int8_t *, struct natpmpd *);
+ssize_t		 natpmp_error_packet(u_int8_t *, u_int8_t, u_int16_t);
 
 struct natpmpd	 natpmpd_env;
-
-int debugsyslog = 0;
 
 struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{  0,      0 },
@@ -45,15 +56,24 @@ struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{ 64,      0 },
 };
 
-struct session {
+struct mapping {
 	u_int8_t		 proto;
 	struct sockaddr		 dst;
 	struct sockaddr		 rdr;
 	struct event		 ev;
-	LIST_ENTRY(session)	 entry;
+	LIST_ENTRY(mapping)	 entry;
 };
 
-LIST_HEAD(, session) sessions = LIST_HEAD_INITIALIZER(sessions);
+struct natpmp_request {
+	u_int8_t		 version;
+	u_int8_t		 opcode;
+	/* The following only appears in mapping requests */
+	u_int16_t		 reserved;
+	u_int16_t		 port[2];
+	u_int32_t		 lifetime;
+};
+
+LIST_HEAD(, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
 
 /* __dead is for lint */
 __dead void
@@ -65,41 +85,48 @@ usage(void)
 	exit(1);
 }
 
-struct session *
-init_session(void)
+struct mapping *
+init_mapping(void)
 {
-	struct session *s;
+	struct mapping *m;
 
-	if ((s = calloc(1, sizeof(struct session))) == NULL)
+	if ((m = calloc(1, sizeof(struct mapping))) == NULL)
 		return (NULL);
 
-	LIST_INSERT_HEAD(&sessions, s, entry);
+	LIST_INSERT_HEAD(&mappings, m, entry);
 
-	return (s);
+	return (m);
 }
 
 void
-expire_session(int fd, short event, void *arg)
+expire_mapping(int fd, short event, void *arg)
 {
-	struct session *s = (struct session *)arg;
+	struct mapping *m = (struct mapping *)arg;
 
-	LIST_REMOVE(s, entry);
-	free(s);
+	log_info("expiring mapping");
 
-	fprintf(stderr, "Removing session\n");
+	/*
+	 * TODO Draft says we should send TCP RST packets to both client and
+	 *      remote peer in the case of any active states when this expiry
+	 *      event fires.  How hard is that to do with pf?
+	 */
 
-	rebuild_rules();
+	LIST_REMOVE(m, entry);
+	free(m);
+
+	if (rebuild_rules() == -1)
+		log_warn("unable to rebuild ruleset");
 }
 
 int
 rebuild_rules(void)
 {
-	struct session *np;
+	struct mapping *m;
 
 	if (prepare_commit() == -1)
 		goto fail;
-	for (np = LIST_FIRST(&sessions); np != NULL; np = LIST_NEXT(np, entry))
-		if (add_rdr(np->proto, &np->dst, &np->rdr) == -1)
+	for (m = LIST_FIRST(&mappings); m != NULL; m = LIST_NEXT(m, entry))
+		if (add_rdr(m->proto, &m->dst, &m->rdr) == -1)
 			goto fail;
 	if (do_commit() == -1) {
 		if (errno != EBUSY)
@@ -109,46 +136,97 @@ rebuild_rules(void)
 			goto fail;
 	}
 	return (0);
+
 fail:
-	fprintf(stderr, "Fail: %s\n", strerror(errno));
 	do_rollback();
 	return (-1);
+}
+
+u_int32_t
+sssoe(struct natpmpd *env)
+{
+	struct timeval	 tv;
+
+	gettimeofday(&tv, NULL);
+
+	return (tv.tv_sec - env->sc_starttime.tv_sec);
+}
+
+ssize_t
+natpmp_address_packet(u_int8_t *packet, struct natpmpd *env)
+{
+	struct natpmp_response {
+		u_int8_t	 version;
+		u_int8_t	 opcode;
+		u_int16_t	 result;
+		u_int32_t	 sssoe;
+		u_int32_t	 address;
+	};
+	struct natpmp_response	*r;
+
+	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
+	r = (struct natpmp_response *)packet;
+	memset(r, 0, sizeof(struct natpmp_response));
+
+	r->version = NATPMPD_MAX_VERSION;
+	r->opcode = 0x80;
+	r->result = NATPMPD_SUCCESS;
+	r->sssoe = htonl(sssoe(env));
+	r->address = env->sc_address.s_addr;
+
+	return (sizeof(struct natpmp_response));
+}
+
+ssize_t
+natpmp_error_packet(u_int8_t *packet, u_int8_t opcode, u_int16_t result)
+{
+	struct natpmp_response {
+		u_int8_t	 version;
+		u_int8_t	 opcode;
+		u_int16_t	 result;
+	};
+	struct natpmp_response	*r;
+
+	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
+	r = (struct natpmp_response *)packet;
+	memset(r, 0, sizeof(struct natpmp_response));
+
+	r->version = NATPMPD_MAX_VERSION;
+	r->opcode = opcode | 0x80;
+	r->result = result;
+
+	return (sizeof(struct natpmp_response));
 }
 
 void
 announce_address(int fd, short event, void *arg)
 {
 	struct natpmpd		*env = (struct natpmpd *)arg;
-	struct sockaddr_in	 sock_w;
+	struct sockaddr_in	 sock;
 	u_int8_t		 packet[NATPMPD_MAX_PACKET_SIZE];
 	ssize_t			 len;
-	struct timeval		 tv;
-	u_int32_t		 sssoe;
 	struct listen_addr	*la;
 
-	memset(&sock_w, 0, sizeof(sock_w));
-	sock_w.sin_family = AF_INET;
-	sock_w.sin_addr.s_addr = htonl(INADDR_ALLHOSTS_GROUP);
-	sock_w.sin_port = htons(NATPMPD_CLIENT_PORT);
+	/* Sending to 224.0.0.1:5350 */
+	memset(&sock, 0, sizeof(sock));
+	sock.sin_family = AF_INET;
+	sock.sin_addr.s_addr = htonl(INADDR_ALLHOSTS_GROUP);
+	sock.sin_port = htons(NATPMPD_CLIENT_PORT);
 
-	memset(&packet, 0, sizeof(packet));
-	packet[1] |= 0x80;
-	len = 12;
+	/* Create the address announce packet */
+	len = natpmp_address_packet(packet, env);
 
-	gettimeofday(&tv, NULL);
-	sssoe = htonl(tv.tv_sec - env->sc_starttime.tv_sec);
-	memcpy(&packet[4], &sssoe, sizeof(sssoe));
-	memcpy(&packet[8], &env->sc_address, 4);
-
-	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
+	/* Loop through all of our listening addresses and send the packet */
+	for (la = TAILQ_FIRST(&env->listen_addrs); la;
+	    la = TAILQ_NEXT(la, entry)) {
 		if (sendto(la->fd, packet, len, 0,
-		    (struct sockaddr *)&sock_w, sizeof(sock_w)) < 0)
+		    (struct sockaddr *)&sock, sizeof(sock)) < 0)
 			log_warn("sendto");
-		la = TAILQ_NEXT(la, entry);
 	}
 
 	env->sc_delay++;
 
+	/* If we haven't sent 10 announcements yet, queue up another */
 	if (env->sc_delay < NATPMPD_MAX_DELAY)
 		evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
 }
@@ -171,30 +249,193 @@ route_handler(int fd, short event, void *arg)
 	check_interface(env);
 }
 
+int
+natpmp_remove_mapping(u_int8_t proto, struct sockaddr_in *rdr)
+{
+	struct sockaddr_in	*sa;
+	struct mapping		*m;
+	int			 count;
+
+	count = 0;
+	for (m = LIST_FIRST(&mappings); m; m = LIST_NEXT(m, entry)) {
+		sa = (struct sockaddr_in *)&m->rdr;
+		if ((m->proto == proto)
+		    && (memcmp(&sa->sin_addr, &rdr->sin_addr, sizeof(struct in_addr)) == 0)
+		    && ((rdr->sin_port == 0)
+			|| (sa->sin_port == rdr->sin_port))) {
+
+			/* Remove the expiry timer */
+			if (evtimer_pending(&m->ev, NULL))
+				evtimer_del(&m->ev);
+
+			/* Remove the mapping */
+			LIST_REMOVE(m, entry);
+			free(m);
+
+			count++;
+		}
+	}
+
+	return (count);
+}
+
+int
+natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
+    struct sockaddr_in *dst, u_int32_t lifetime)
+{
+	struct mapping		*m;
+	struct timeval		 tv;
+	struct sockaddr_in	*sa;
+
+	memset(&tv, 0, sizeof(tv));
+	tv.tv_sec = lifetime;
+
+	/* Check for any mapping for the given internal address and port */
+	for (m = LIST_FIRST(&mappings); m; m = LIST_NEXT(m, entry)) {
+		if ((m->proto == proto) &&
+		    (memcmp(&m->rdr, rdr, sizeof(m->rdr)) == 0))
+			break;
+	}
+
+	if (m != NULL) {
+		/*
+		 * Update the requested external port from the live mapping 
+		 * if it differs.
+		 */
+		if (memcmp(&m->dst, dst, sizeof(m->dst)) != 0) {
+			fprintf(stderr, "Existing mapping with different port\n");
+			sa = (struct sockaddr_in *)&m->dst;
+			dst->sin_port = sa->sin_port;
+		}
+
+		/* Refresh the expiry timer */
+		if (evtimer_pending(&m->ev, NULL))
+			evtimer_del(&m->ev);
+		evtimer_add(&m->ev, &tv);
+
+		return (0);
+	}
+
+	if((m = init_mapping()) == NULL)
+		fatal("init_mapping");
+
+	dst->sin_port = htons(IPPORT_HIFIRSTAUTO +
+	    arc4random_uniform(IPPORT_HILASTAUTO - IPPORT_HIFIRSTAUTO));
+
+	m->proto = proto;
+	memcpy(&m->dst, dst, sizeof(m->dst));
+	memcpy(&m->rdr, rdr, sizeof(m->rdr));
+
+	evtimer_set(&m->ev, expire_mapping, m);
+	evtimer_add(&m->ev, &tv);
+
+	return (1);
+}
+
+ssize_t
+natpmp_mapping(u_int8_t *packet, u_int8_t proto, struct sockaddr_in *rdr,
+    struct sockaddr_in *dst, u_int32_t lifetime, struct natpmpd *env)
+{
+	struct natpmp_response {
+		u_int8_t		 version;
+		u_int8_t		 opcode;
+		u_int16_t		 result;
+		u_int32_t		 sssoe;
+		u_int16_t		 port[2];
+		u_int32_t		 lifetime;
+	};
+	struct natpmp_response		*r;
+	int				 count;
+	char				 rdr_ip[INET_ADDRSTRLEN];
+	char				 dst_ip[INET_ADDRSTRLEN];
+
+	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
+	r = (struct natpmp_response *)packet;
+	memset(r, 0, sizeof(struct natpmp_response));
+
+	inet_ntop(AF_INET, &rdr->sin_addr, rdr_ip, INET_ADDRSTRLEN);
+	inet_ntop(AF_INET, &dst->sin_addr, dst_ip, INET_ADDRSTRLEN);
+
+	r->version = NATPMPD_MAX_VERSION;
+	r->opcode = (proto == IPPROTO_UDP) ? 0x81 : 0x82;
+	r->result = NATPMPD_SUCCESS;
+	r->sssoe = htonl(sssoe(env));
+
+	log_info("%s request, %s:%d -> %s:%d, expires in %d seconds",
+	    (proto == IPPROTO_UDP) ? "UDP" : "TCP",
+	    dst_ip, ntohs(dst->sin_port), rdr_ip, ntohs(rdr->sin_port),
+	    ntohl(lifetime));
+
+	/* From the spec:
+	 *
+	 * +---------------+---------------+---------------+
+	 * |   rdr port    |   dst port    |   lifetime    |
+	 * +-------+-------+-------+-------+-------+-------+
+	 * |  = 0  |  > 0  |  = 0  |  > 0  |  = 0  |  > 0  |
+	 * +-------+-------+-------+-------+-------+-------+
+	 * |       |   *   |   *   |       |       |   *   | Map random port
+	 * |       |   *   |       |   *   |       |   *   | Map preferred port
+	 * |       |   *   |       |       |   *   |       | Delete one
+	 * |   *   |       |   *   |       |   *   |       | Delete all
+	 * +-------+-------+-------+-------+-------+-------+
+	 */
+	count = 0;
+	if (rdr->sin_port > 0) {
+		if (lifetime > 0) {
+			/* Create mapping with preferred or random port */
+			count = natpmp_create_mapping(proto, rdr, dst,
+			    ntohl(lifetime));
+
+			r->port[0] = rdr->sin_port;
+			r->port[1] = dst->sin_port;
+			r->lifetime = lifetime;
+		} else {
+			/* Delete single mapping */
+			count = natpmp_remove_mapping(proto, rdr);
+
+			if (count > 1)
+				log_warn("%d mappings removed", count);
+			else
+				log_info("mapping removed");
+
+			r->port[0] = rdr->sin_port;
+			r->port[1] = 0;
+			r->lifetime = 0;
+		}
+	} else {
+		/* Delete all mappings */
+		count = natpmp_remove_mapping(proto, rdr);
+
+		log_info("%d mappings removed", count);
+
+		r->port[0] = 0;
+		r->port[1] = 0;
+		r->lifetime = 0;
+	}
+
+	if (count)
+		if (rebuild_rules() == -1)
+			log_warn("unable to rebuild ruleset");
+
+	return (sizeof(struct natpmp_response));
+}
+
 void
 natpmp_handler(int fd, short event, void *arg)
 {
-	struct natpmpd *env = (struct natpmpd *)arg;
-	struct sockaddr_storage ss;
-	u_int8_t request[NATPMPD_MAX_PACKET_SIZE];
-	u_int8_t response[NATPMPD_MAX_PACKET_SIZE];
-	socklen_t slen;
-	ssize_t len;
-	u_int8_t version;
-	u_int8_t opcode;
-	u_int16_t result;
-	u_int32_t sssoe;
-	struct timeval tv;
-	u_int32_t lifetime;
-	struct sockaddr_in dst, rdr;
-	struct in_addr addr;
-	u_int8_t proto;
-	struct timeval timeout;
-	struct session *s;
-	struct session *np;
+	struct natpmpd		*env = (struct natpmpd *)arg;
+	struct sockaddr_storage	 ss;
+	u_int8_t		 request_storage[NATPMPD_MAX_PACKET_SIZE];
+	u_int8_t		 response_storage[NATPMPD_MAX_PACKET_SIZE];
+	struct natpmp_request	*request;
+	socklen_t		 slen;
+	ssize_t			 len;
+	struct sockaddr_in	 dst;
+	struct sockaddr_in	 rdr;
+	u_int8_t		 proto;
 
 	slen = sizeof(ss);
-	if ((len = recvfrom(fd, packet, sizeof(packet), 0,
+	if ((len = recvfrom(fd, request_storage, sizeof(request_storage), 0,
 	    (struct sockaddr *)&ss, &slen)) < 1 )
 		return;
 
@@ -202,120 +443,51 @@ natpmp_handler(int fd, short event, void *arg)
 	if (len < 2)
 		return;
 
-	version = packet[0];
-	opcode = packet[1];
-	result = NATPMPD_SUCCESS;
+	assert(sizeof(struct natpmp_request) <= NATPMPD_MAX_PACKET_SIZE);
 
-	/* No opcode should be greater than 127 */
-	if (opcode & 0x80)
+	request = (struct natpmp_request *)&request_storage;
+
+	/* No opcode in a request should be greater than 127 */
+	if (request->opcode & 0x80)
 		return;
 
-	packet[1] = opcode | 0x80;
-
-	if (version > NATPMPD_MAX_VERSION) {
-		packet[0] = NATPMPD_MAX_VERSION;
-		result = NATPMPD_BAD_VERSION;
-		len = 4;
-	} else if (opcode > 2) {
-		result = NATPMPD_BAD_OPCODE;
-		len = 4;
+	if (request->version > NATPMPD_MAX_VERSION) {
+		len = natpmp_error_packet(response_storage, request->opcode,
+		    NATPMPD_BAD_VERSION);
+		len = sendto(fd, response_storage, len, 0, (struct sockaddr *)&ss, slen);
+		return;
 	}
 
-	/* opcode in (1, 2)
-	 *
-	 * +---------------+---------------+---------------+
-	 * | internal port | external port |   lifetime    |
-	 * +-------+-------+-------+-------+-------+-------+
-	 * |  = 0  |  > 0  |  = 0  |  > 0  |  = 0  |  > 0  |
-	 * +-------+-------+-------+-------+-------+-------+
-	 * |       |   *   |   *   |       |       |   *   |
-	 * +-------+-------+-------+-------+-------+-------+
-	 * |       |   *   |       |   *   |       |   *   |
-	 * +-------+-------+-------+-------+-------+-------+
-	 * |       |   *   |       |       |   *   |       |
-	 * +-------+-------+-------+-------+-------+-------+
-	 * |   *   |       |   *   |       |   *   |       |
-	 * +-------+-------+-------+-------+-------+-------+
-	 * |       |       |       |       |       |       |
-	 * +-------+-------+-------+-------+-------+-------+
-	 */
+	proto = 0;
+	switch (request->opcode) {
+	case 0:
+		len = natpmp_address_packet(response_storage, env);
+		break;
+	case 1:
+		proto = IPPROTO_UDP;
+		/* FALLTHROUGH */
+	case 2:
+		if (proto == 0)
+			proto = IPPROTO_TCP;
 
-	if (1) {
-		gettimeofday(&tv, NULL);
-		sssoe = htonl(tv.tv_sec - env->sc_starttime.tv_sec);
+		memcpy(&rdr, &ss, sizeof(rdr));
+		memcpy(&rdr.sin_port, &request->port[0], sizeof(u_int16_t));
 
-		switch (opcode) {
-		case 0:
-			memcpy(&packet[8], &env->sc_address.s_addr, 4);
-			len = 12;
-			break;
-		case 1: // UDP
-		case 2: // TCP
-			memcpy(&rdr, &ss, sizeof(rdr));
-			memcpy(&rdr.sin_port, &packet[4], 2);
-			memset(&dst, 0, sizeof(dst));
-			dst.sin_family = AF_INET;
-			dst.sin_addr = env->sc_address;
-			memcpy(&dst.sin_port, &packet[6], 2);
-			memcpy(&lifetime, &packet[8], 4);
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_addr = env->sc_address;
+		memcpy(&dst.sin_port, &request->port[1], sizeof(u_int16_t));
 
-			proto = (opcode == 1) ? IPPROTO_UDP : IPPROTO_TCP;
-
-			/* Stupid inet_ntoa */
-			fprintf(stderr, "%s map request for %s:%d ", (opcode == 1) ? "UDP" : "TCP", inet_ntoa(env->sc_address), ntohs(((struct sockaddr_in *)&dst)->sin_port));
-			fprintf(stderr, "-> %s:%d, lifetime %d seconds\n", inet_ntoa(((struct sockaddr_in *)&rdr)->sin_addr), ntohs(((struct sockaddr_in *)&rdr)->sin_port), ntohl(lifetime));
-
-			inet_aton("192.168.138.1", &addr);
-			if (memcmp(&((struct sockaddr_in *)&ss)->sin_addr, &addr, sizeof(struct in_addr)) == 0) {
-				for (np = LIST_FIRST(&sessions); np != NULL; np = LIST_NEXT(np, entry)) {
-					if ((np->proto == proto) &&
-					    (memcmp(&np->rdr, &rdr, sizeof(np->rdr)) == 0) &&
-					    (memcmp(&np->dst, &dst, sizeof(np->dst)) == 0))
-						break;
-				}
-
-				memset(&timeout, 0, sizeof(timeout));
-				timeout.tv_sec = ntohl(lifetime);
-
-				if (np == NULL) {
-					if((s = init_session()) == NULL)
-						fatal("init_session");
-					s->proto = proto;
-					memcpy(&s->dst, &dst, sizeof(s->dst));
-					memcpy(&s->rdr, &rdr, sizeof(s->rdr));
-
-					evtimer_set(&s->ev, expire_session, s);
-					evtimer_add(&s->ev, &timeout);
-
-					rebuild_rules();
-				} else {
-					/* Should always be true? */
-					if (evtimer_pending(&np->ev, NULL))
-						evtimer_del(&np->ev);
-					evtimer_add(&np->ev, &timeout);
-				}
-				
-				/* FIXME Failure here should return NATPMPD_NO_RESOURCES */
-				memcpy(&packet[12], &packet[8], 4);
-				memcpy(&packet[8], &packet[4], 4);
-			} else {
-				/* XXX Just copy the packet data and say not
-				 *     allowed
-				 */
-				memcpy(&packet[12], &packet[8], 4);
-				memcpy(&packet[8], &packet[4], 4);
-				result = NATPMPD_NOT_AUTHORISED;
-			}
-			len = 16;
-			break;
-		}
-
-		memcpy(&packet[4], &sssoe, sizeof(sssoe));
+		len = natpmp_mapping(response_storage, proto, &rdr, &dst,
+		    request->lifetime, env);
+		break;
+	default:
+		len = natpmp_error_packet(response_storage, request->opcode,
+		    NATPMPD_BAD_OPCODE);
+		break;
 	}
 
-	memcpy(&packet[2], &result, sizeof(result));
-	
-	len = sendto(fd, packet, len, 0, (struct sockaddr *)&ss, slen);
+	len = sendto(fd, response_storage, len, 0, (struct sockaddr *)&ss, slen);
 }
 
 void
@@ -345,12 +517,13 @@ check_interface(struct natpmpd *env)
 	    sizeof(struct in_addr)) == 0)
 		return;
 
+	memcpy(&env->sc_address, &ifaddr->sin_addr, sizeof(struct in_addr));
+
 	/* If the address changed again while we were still announcing the
 	 * old one, cancel the pending announcement before starting again
 	 */
 	if (evtimer_pending(&env->sc_announce_ev, NULL))
 		evtimer_del(&env->sc_announce_ev);
-	memcpy( &env->sc_address, &ifaddr->sin_addr, sizeof(struct in_addr));
 	env->sc_delay = 0;
 	evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
 }
@@ -386,7 +559,6 @@ main(int argc, char *argv[])
 			break;
 		case 'v':
 			flags |= NATPMPD_F_VERBOSE;
-			debugsyslog = 1;
 			break;
 		default:
 			usage();
@@ -421,8 +593,9 @@ main(int argc, char *argv[])
 			fatalx("king bula sez: af borked");
 		}
 
-		log_info("listening on %s",
-		    log_sockaddr((struct sockaddr *)&la->sa));
+		log_info("listening on %s:%d",
+		    log_sockaddr((struct sockaddr *)&la->sa),
+		    NATPMPD_SERVER_PORT);
 
 		if ((la->fd = socket(la->sa.ss_family, SOCK_DGRAM, 0)) == -1)
 			fatal("socket");
@@ -474,7 +647,8 @@ main(int argc, char *argv[])
 	event_init();
 
 	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
-		event_set(&la->ev, la->fd, EV_READ|EV_PERSIST, natpmp_handler, env);
+		event_set(&la->ev, la->fd, EV_READ|EV_PERSIST,
+		    natpmp_handler, env);
 		event_add(&la->ev, NULL);
 		la = TAILQ_NEXT(la, entry);
 	}

@@ -9,7 +9,6 @@
 #include "natpmpd.h"
 
 int	 debug;
-extern int debugsyslog;
 
 void	 logit(int, const char *, ...);
 
@@ -104,7 +103,7 @@ log_debug(const char *emsg, ...)
 {
 	va_list	 ap;
 
-	if (debug || debugsyslog) {
+	if (debug) {
 		va_start(ap, emsg);
 		vlog(LOG_DEBUG, emsg, ap);
 		va_end(ap);
