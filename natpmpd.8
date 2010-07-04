@@ -1,3 +1,4 @@
+.Dd $Mdocdate$
 .Dt NATPMPD 8
 .Os
 .Sh NAME
@@ -5,20 +6,66 @@
 .Nd NAT-PMP daemon
 .Sh SYNOPSIS
 .Nm natpmpd
-.Op Fl dv
+.Op Fl dnv
 .Op Fl f Ar file
 .Sh DESCRIPTION
 .Nm
 is a daemon which implements the NAT-PMP protocol.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl d
+Do not daemonize and log to
+.Em stderr .
+.It Fl f Ar file
+Use
+.Ar file
+as the configuration file, instead of the default
+.Pa /etc/natpmpd.conf .
+.It Fl n
+Configtest mode.
+Only check the configuration file for validity.
+.It Fl v
+Produce more verbose output.
+.El
+.Sh CONFIGURATION
+To allow
+.Nm
+to create mappings,
+.Xr pf.conf 5
+needs the following rule.
+.Bd -literal -offset 2n
+anchor "natpmpd"
+.Ed
 .Sh FILES
-.Bl -tag -compact
+.Bl -tag -width "/var/run/natpmpd.sock" -compact
 .It Pa /etc/natpmpd.conf
 default
 .Nm
 configuration file
+.It Pa /var/run/natpmpd.sock
+default
+.Nm
+control socket
 .El
 .Sh SEE ALSO
-.Xr natpmpd.conf 5
+.Xr natpmpd.conf 5 ,
+.Xr natpmpctl 8 ,
+.Xr pf 4 ,
+.Xr pf.conf 5
+.Rs
+.%R draft-cheshire-nat-pmp-03
+.%T NAT Port Mapping Protocol (NAT-PMP)
+.%D April 2008
+.Re
+.Sh CAVEATS
+.Xr pf 4
+does not allow the ruleset to be modified if the system is running at a
+.Xr securelevel 7
+higher than 1.
+At that level
+.Nm
+cannot add rules to the anchors and NAT-PMP requests will not work.
 .Sh AUTHORS
 The
 .Nm
