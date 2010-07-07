@@ -576,6 +576,26 @@ main(int argc, char *argv[])
 
 	/* XXX Check for an interface and at least one address to listen on */
 
+	if (noaction) {
+		fprintf(stderr, "configuration ok\n");
+		exit(0);
+	}
+
+	if (geteuid())
+		errx(1, "need root privileges");
+
+	/*if (getpwnam(NATPMPD_USER) == NULL)
+		errx(1, "unknown user %s", NATPMPD_USER);*/
+
+	log_init(debug);
+
+	if (!debug) {
+		if (daemon(1, 0) == -1)
+			err(1, "failed to daemonize");
+	}
+
+	gettimeofday(&env->sc_starttime, NULL);
+
 	/* Initialise the packet filter and clear out our anchor */
 	init_filter(NULL, NULL, 0);
 	if (rebuild_rules() == -1)
@@ -637,10 +657,6 @@ main(int argc, char *argv[])
 	if (setsockopt(rt_fd, PF_ROUTE, ROUTE_MSGFILTER,
 	    &rtfilter, sizeof(rtfilter)) == -1)
 		fatal("setsockopt");
-
-	log_init(debug);
-
-	gettimeofday(&env->sc_starttime, NULL);
 
 	log_info("startup");
 
