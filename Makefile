@@ -1,3 +1,5 @@
+#	$Id$
+
 PROG=	natpmpd
 SRCS=	natpmpd.c log.c parse.y filter.c
 CFLAGS+= -Wall -I${.CURDIR}
