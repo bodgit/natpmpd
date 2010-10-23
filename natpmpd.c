@@ -75,7 +75,7 @@ struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 };
 
 struct mapping {
-	u_int8_t		 proto;
+	u_int32_t		 proto;
 	struct sockaddr		 dst;
 	struct sockaddr		 rdr;
 	struct event		 ev;
