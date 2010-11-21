@@ -302,14 +302,21 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
     struct sockaddr_in *dst, u_int32_t lifetime)
 {
 	struct mapping		*m;
+	struct mapping		*r;
 	struct timeval		 tv;
 	struct sockaddr_in	*sa;
 
 	memset(&tv, 0, sizeof(tv));
 	tv.tv_sec = lifetime;
 
-	/* Check for any mapping for the given internal address and port */
-	for (m = LIST_FIRST(&mappings); m; m = LIST_NEXT(m, entry)) {
+	/* Check for any mapping for the given internal address and port.
+	 * Remember any matching mapping where the internal address and port
+	 * match, but for a different protocol
+	 */
+	for (m = LIST_FIRST(&mappings), r = NULL; m; m = LIST_NEXT(m, entry)) {
+		if ((m->proto != proto) &&
+		    (memcmp(&m->rdr, rdr, sizeof(m->rdr)) == 0))
+			r = m;
 		if ((m->proto == proto) &&
 		    (memcmp(&m->rdr, rdr, sizeof(m->rdr)) == 0))
 			break;
@@ -337,8 +344,16 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 	if((m = init_mapping()) == NULL)
 		fatal("init_mapping");
 
-	dst->sin_port = htons(IPPORT_HIFIRSTAUTO +
-	    arc4random_uniform(IPPORT_HILASTAUTO - IPPORT_HIFIRSTAUTO));
+	/* If we found a "related" mapping use the port from that as per the
+	 * draft, otherwise conjure up a random one
+	 */
+	if (r != NULL) {
+		sa = (struct sockaddr_in *)&r->dst;
+		dst->sin_port = sa->sin_port;
+	} else
+		/* Check for collisions? */
+		dst->sin_port = htons(IPPORT_HIFIRSTAUTO +
+		    arc4random_uniform(IPPORT_HILASTAUTO - IPPORT_HIFIRSTAUTO));
 
 	m->proto = proto;
 	memcpy(&m->dst, dst, sizeof(m->dst));
