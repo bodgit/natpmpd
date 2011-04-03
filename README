@@ -1,0 +1,7 @@
+Remember to add a _natpmpd user & group. Something like:
+
+# groupadd -g 99 _natpmpd
+# useradd -c "NAT-PMP Daemon" -d /var/empty -g 99 -s /sbin/nologin -u 99 \
+	_natpmpd
+
+Obviously pick a gid & uid that doesn't clash.
