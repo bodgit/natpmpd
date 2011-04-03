@@ -39,6 +39,7 @@
 #include <err.h>
 #include <unistd.h>
 #include <assert.h>
+#include <pwd.h>
 
 #include "natpmpd.h"
 

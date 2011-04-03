@@ -547,7 +547,6 @@ host_dns(const char *s, struct ntp_addr **hn)
 	struct addrinfo		 hints, *res0, *res;
 	int			 error, cnt = 0;
 	struct sockaddr_in	*sa_in;
-	struct sockaddr_in6	*sa_in6;
 	struct ntp_addr		*h, *hh = NULL;
 
 	bzero(&hints, sizeof(hints));
