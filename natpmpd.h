@@ -30,7 +30,7 @@
 #include <event.h>
 #include <netdb.h>
 
-#define NATPMPD_USER		 "_natpmp"
+#define NATPMPD_USER		 "_natpmpd"
 #define CONF_FILE		 "/etc/natpmpd.conf"
 
 #define NATPMPD_SERVER_PORT 	 5351
@@ -103,6 +103,8 @@ const char *	 log_sockaddr(struct sockaddr *);
 
 /* parse.y */
 struct natpmpd	*parse_config(const char *, u_int);
+int		 host(const char *, struct ntp_addr **);
+int		 host_dns(const char *, struct ntp_addr **);
 
 /* filter.c */
 void		 init_filter(char *, char *, int);

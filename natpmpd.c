@@ -570,6 +570,7 @@ main(int argc, char *argv[])
 	const char		*conffile = CONF_FILE;
 	u_int			 flags = 0;
 	unsigned char		 loop = 0;
+	struct passwd		*pw;
 
 	struct event rt_ev;
 	int rt_fd;
@@ -617,8 +618,8 @@ main(int argc, char *argv[])
 	if (geteuid())
 		errx(1, "need root privileges");
 
-	/*if (getpwnam(NATPMPD_USER) == NULL)
-		errx(1, "unknown user %s", NATPMPD_USER);*/
+	if ((pw = getpwnam(NATPMPD_USER)) == NULL)
+		errx(1, "unknown user %s", NATPMPD_USER);
 
 	log_init(debug);
 
@@ -692,6 +693,16 @@ main(int argc, char *argv[])
 		fatal("setsockopt");
 
 	log_info("startup");
+
+	if (chroot(pw->pw_dir) == -1)
+		fatal("chroot");
+	if (chdir("/") == -1)
+		fatal("chdir(\"/\")");
+
+	if (setgroups(1, &pw->pw_gid) ||
+	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
+	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
+		fatal("cannot drop privileges");
 
 	event_init();
 
