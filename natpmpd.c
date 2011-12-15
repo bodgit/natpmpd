@@ -280,7 +280,7 @@ route_handler(int fd, short event, void *arg)
 				if (i == RTA_IFP && (strcmp(env->sc_interface,
 				    ((struct sockaddr_dl *)cp)->sdl_data) == 0))
 					check_interface(env);
-				cp += ((struct sockaddr *)cp)->sa_len;
+				cp += SA_RLEN((struct sockaddr *)cp);
 			}
 		break;
 	case RTM_IFANNOUNCE:
@@ -608,7 +608,7 @@ check_interface(struct natpmpd *env)
 		evtimer_del(&env->sc_announce_ev);
 
 	/* Don't announce an interface having 0.0.0.0 as an address */
-	if (ifaddr->sin_addr.s_addr == htonl(INADDR_ANY))
+	if (env->sc_address.s_addr == htonl(INADDR_ANY))
 		return;
 
 	env->sc_delay = 0;
@@ -741,7 +741,8 @@ main(int argc, char *argv[])
 		fatal("socket");
 
 	/* Hopefully this is enough? */
-	rtfilter = ROUTE_FILTER(RTM_NEWADDR|RTM_DELADDR|RTM_IFANNOUNCE);
+	rtfilter = ROUTE_FILTER(RTM_NEWADDR) | ROUTE_FILTER(RTM_DELADDR) |
+	    ROUTE_FILTER(RTM_IFANNOUNCE);
 	if (setsockopt(rt_fd, PF_ROUTE, ROUTE_MSGFILTER,
 	    &rtfilter, sizeof(rtfilter)) == -1)
 		fatal("setsockopt");

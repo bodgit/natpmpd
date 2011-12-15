@@ -30,6 +30,9 @@
 #include <event.h>
 #include <netdb.h>
 
+#define SALIGN			 (sizeof(long) - 1)
+#define SA_RLEN(sa)		 ((sa)->sa_len ? (((sa)->sa_len + SALIGN) & ~SALIGN) : (SALIGN + 1))
+
 #define NATPMPD_USER		 "_natpmpd"
 #define CONF_FILE		 "/etc/natpmpd.conf"
 
