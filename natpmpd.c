@@ -33,6 +33,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <event.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@
 
 #include "natpmpd.h"
 
+void		 handle_signal(int, short, void *);
 __dead void	 usage(void);
 struct mapping	*init_mapping(void);
 void		 expire_mapping(int, short, void *);
@@ -95,6 +97,29 @@ struct natpmp_request {
 
 LIST_HEAD(, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
 
+void
+handle_signal(int sig, short event, void *arg)
+{
+	struct mapping	*m;
+
+	log_info("exiting on signal %d", sig);
+
+	/* Remove every mapping and then rebuild the ruleset which should
+	 * hopefully result in an empty anchor after we're gone
+	 */
+	for (m = LIST_FIRST(&mappings); m != NULL; m = LIST_NEXT(m, entry)) {
+		if (evtimer_pending(&m->ev, NULL))
+			evtimer_del(&m->ev);
+		LIST_REMOVE(m, entry);
+		free(m);
+	}
+
+	if (rebuild_rules() == -1)
+		log_warn("unable to rebuild ruleset");
+
+	exit(0);
+}
+
 /* __dead is for lint */
 __dead void
 usage(void)
@@ -108,7 +133,7 @@ usage(void)
 struct mapping *
 init_mapping(void)
 {
-	struct mapping *m;
+	struct mapping	*m;
 
 	if ((m = calloc(1, sizeof(struct mapping))) == NULL)
 		return (NULL);
@@ -121,7 +146,7 @@ init_mapping(void)
 void
 expire_mapping(int fd, short event, void *arg)
 {
-	struct mapping *m = (struct mapping *)arg;
+	struct mapping	*m = (struct mapping *)arg;
 
 	log_info("expiring mapping");
 
@@ -141,7 +166,7 @@ expire_mapping(int fd, short event, void *arg)
 int
 rebuild_rules(void)
 {
-	struct mapping *m;
+	struct mapping	*m;
 
 	if (prepare_commit() == -1)
 		goto fail;
@@ -625,12 +650,14 @@ main(int argc, char *argv[])
 	u_int			 flags = 0;
 	unsigned char		 loop = 0;
 	struct passwd		*pw;
-
-	struct event rt_ev;
-	int rt_fd;
-	unsigned int rtfilter;
-	struct natpmpd *env;
-	struct listen_addr *la;
+	struct event		 rt_ev;
+	int			 rt_fd;
+	unsigned int		 rtfilter;
+	struct natpmpd		*env;
+	struct listen_addr	*la;
+	struct event		 ev_sighup;
+	struct event		 ev_sigint;
+	struct event		 ev_sigterm;
 
 	log_init(1);	/* log to stderr until daemonized */
 
@@ -760,6 +787,14 @@ main(int argc, char *argv[])
 		fatal("cannot drop privileges");
 
 	event_init();
+
+	signal(SIGPIPE, SIG_IGN);
+	signal_set(&ev_sighup, SIGHUP, handle_signal, env);
+	signal_set(&ev_sigint, SIGINT, handle_signal, env);
+	signal_set(&ev_sigterm, SIGTERM, handle_signal, env);
+	signal_add(&ev_sighup, NULL);
+	signal_add(&ev_sigint, NULL);
+	signal_add(&ev_sigterm, NULL);
 
 	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
 		event_set(&la->ev, la->fd, EV_READ|EV_PERSIST,
