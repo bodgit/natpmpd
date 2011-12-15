@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 
 #include <net/if.h>
+#include <net/if_dl.h>
 #include <net/route.h>
 #include <net/pfvar.h>
 
@@ -253,19 +254,46 @@ announce_address(int fd, short event, void *arg)
 void
 route_handler(int fd, short event, void *arg)
 {
-	struct natpmpd		*env = (struct natpmpd *)arg;
-	char			 msg[2048];
-	struct rt_msghdr	*rtm = (struct rt_msghdr *)&msg;
-	ssize_t			 len;
+	struct natpmpd			*env = (struct natpmpd *)arg;
+	char				 msg[RTM_MAXSIZE];
+	struct rt_msghdr		*rtm = (struct rt_msghdr *)&msg;
+	struct ifa_msghdr		*ifam;
+	struct if_announcemsghdr	*ifan;
+	ssize_t				 len;
+	char				*cp;
+	int				 i;
 
 	len = read(fd, msg, sizeof(msg));
 
 	if (rtm->rtm_version != RTM_VERSION)
 		return;
-	if (rtm->rtm_type != RTM_NEWADDR)
-		return;
 
-	check_interface(env);
+	switch (rtm->rtm_type) {
+	case RTM_NEWADDR:
+		/* FALLTHROUGH */
+	case RTM_DELADDR:
+		ifam = (struct ifa_msghdr *)rtm;
+		cp = ((char *)(ifam + 1));
+		/* We only care about matching the interface name */
+		for (i = 1; ifam->ifam_addrs && i <= RTA_IFP; i <<= 1)
+			if (i & ifam->ifam_addrs) {
+				if (i == RTA_IFP && (strcmp(env->sc_interface,
+				    ((struct sockaddr_dl *)cp)->sdl_data) == 0))
+					check_interface(env);
+				cp += ((struct sockaddr *)cp)->sa_len;
+			}
+		break;
+	case RTM_IFANNOUNCE:
+		ifan = (struct if_announcemsghdr *)rtm;
+		/* Interface got destroyed (PPPoE, etc.) */
+		if ((ifan->ifan_what == IFAN_DEPARTURE)
+		    && (strcmp(env->sc_interface, ifan->ifan_name) == 0))
+			check_interface(env);
+		break;
+	default:
+		return;
+		/* NOTREACHED */
+	}
 }
 
 int
@@ -492,6 +520,15 @@ natpmp_handler(int fd, short event, void *arg)
 		return;
 	}
 
+	/* We don't have an external address */
+	if (env->sc_address.s_addr == htonl(INADDR_ANY)) {
+		len = natpmp_error_packet(response_storage, request->opcode,
+		    NATPMPD_NETWORK_FAILURE);
+		len = sendto(fd, response_storage, len, 0,
+		    (struct sockaddr *)&ss, slen);
+		return;
+	}
+
 	proto = 0;
 	switch (request->opcode) {
 	case 0:
@@ -538,26 +575,42 @@ check_interface(struct natpmpd *env)
 		fatal("socket");
 
 	if (ioctl(s, SIOCGIFADDR, &ifr) == -1)
-		fatal("ioctl");
+		/* PPPoE device might not exist or be functional yet, etc. */
+		switch (errno) {
+		case ENXIO:
+			/* FALLTHROUGH */
+		case EADDRNOTAVAIL:
+			break;
+		default:
+			fatal("ioctl");
+			/* NOTREACHED */
+		}
 
 	close(s);
 
-	if (ifr.ifr_addr.sa_family != AF_INET)
-		return;
-	ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+	if (ifr.ifr_addr.sa_family == AF_INET) {
+		ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
 
-	/* Primary address hasn't changed */
-	if (memcmp(&env->sc_address, &ifaddr->sin_addr,
-	    sizeof(struct in_addr)) == 0)
-		return;
+		/* Primary address hasn't changed */
+		if (memcmp(&env->sc_address, &ifaddr->sin_addr,
+		    sizeof(struct in_addr)) == 0)
+			return;
 
-	memcpy(&env->sc_address, &ifaddr->sin_addr, sizeof(struct in_addr));
+		memcpy(&env->sc_address, &ifaddr->sin_addr,
+		    sizeof(struct in_addr));
+	} else
+		env->sc_address.s_addr = htonl(INADDR_ANY);
 
 	/* If the address changed again while we were still announcing the
 	 * old one, cancel the pending announcement before starting again
 	 */
 	if (evtimer_pending(&env->sc_announce_ev, NULL))
 		evtimer_del(&env->sc_announce_ev);
+
+	/* Don't announce an interface having 0.0.0.0 as an address */
+	if (ifaddr->sin_addr.s_addr == htonl(INADDR_ANY))
+		return;
+
 	env->sc_delay = 0;
 	evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
 }
@@ -688,7 +741,7 @@ main(int argc, char *argv[])
 		fatal("socket");
 
 	/* Hopefully this is enough? */
-	rtfilter = ROUTE_FILTER(RTM_NEWADDR);
+	rtfilter = ROUTE_FILTER(RTM_NEWADDR|RTM_DELADDR|RTM_IFANNOUNCE);
 	if (setsockopt(rt_fd, PF_ROUTE, ROUTE_MSGFILTER,
 	    &rtfilter, sizeof(rtfilter)) == -1)
 		fatal("setsockopt");
