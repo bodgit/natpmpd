@@ -1,0 +1,4 @@
+natpmpd
+*.o
+parse.c
+*.manlint

@@ -45,6 +45,32 @@
 
 #include "natpmpd.h"
 
+struct natpmp_request {
+	u_int8_t		 version;
+	u_int8_t		 opcode;
+	/* The following only appears in mapping requests */
+	u_int16_t		 reserved;
+	u_int16_t		 port[2];
+	u_int32_t		 lifetime;
+};
+
+struct natpmp_response {
+	u_int8_t			 version;
+	u_int8_t			 opcode;
+	u_int16_t			 result;
+	u_int32_t			 sssoe;
+	/* The following only appears in response to valid requests */
+	union {
+		struct {
+			u_int32_t	 address;
+		} announce;
+		struct {
+			u_int16_t	 port[2];
+			u_int32_t	 lifetime;
+		} mapping;
+	} data;
+};
+
 void		 handle_signal(int, short, void *);
 __dead void	 usage(void);
 struct mapping	*init_mapping(void);
@@ -54,16 +80,13 @@ void		 route_handler(int, short, void *);
 int		 natpmp_remove_mapping(u_int8_t, struct sockaddr_in *);
 int		 natpmp_create_mapping(u_int8_t, struct sockaddr_in *,
 		     struct sockaddr_in *, u_int32_t);
-ssize_t		 natpmp_mapping(u_int8_t *, u_int8_t, struct sockaddr_in *,
-		     struct sockaddr_in *, u_int32_t, struct natpmpd *);
+ssize_t		 natpmp_mapping(struct natpmp_response *, u_int8_t,
+		     struct sockaddr_in *, struct sockaddr_in *, u_int32_t,
+		     struct natpmpd *);
 void		 natpmp_handler(int, short, void *);
 void		 check_interface(struct natpmpd *);
 int		 rebuild_rules(void);
 u_int32_t	 sssoe(struct natpmpd *);
-ssize_t		 natpmp_address_packet(u_int8_t *, struct natpmpd *);
-ssize_t		 natpmp_error_packet(u_int8_t *, u_int8_t, u_int16_t);
-
-struct natpmpd	 natpmpd_env;
 
 struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{  0,      0 },
@@ -84,15 +107,6 @@ struct mapping {
 	struct sockaddr		 rdr;
 	struct event		 ev;
 	LIST_ENTRY(mapping)	 entry;
-};
-
-struct natpmp_request {
-	u_int8_t		 version;
-	u_int8_t		 opcode;
-	/* The following only appears in mapping requests */
-	u_int16_t		 reserved;
-	u_int16_t		 port[2];
-	u_int32_t		 lifetime;
 };
 
 LIST_HEAD(, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
@@ -197,59 +211,13 @@ sssoe(struct natpmpd *env)
 	return (tv.tv_sec - env->sc_starttime.tv_sec);
 }
 
-ssize_t
-natpmp_address_packet(u_int8_t *packet, struct natpmpd *env)
-{
-	struct natpmp_response {
-		u_int8_t	 version;
-		u_int8_t	 opcode;
-		u_int16_t	 result;
-		u_int32_t	 sssoe;
-		u_int32_t	 address;
-	};
-	struct natpmp_response	*r;
-
-	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
-	r = (struct natpmp_response *)packet;
-	memset(r, 0, sizeof(struct natpmp_response));
-
-	r->version = NATPMPD_MAX_VERSION;
-	r->opcode = 0x80;
-	r->result = NATPMPD_SUCCESS;
-	r->sssoe = htonl(sssoe(env));
-	r->address = env->sc_address.s_addr;
-
-	return (sizeof(struct natpmp_response));
-}
-
-ssize_t
-natpmp_error_packet(u_int8_t *packet, u_int8_t opcode, u_int16_t result)
-{
-	struct natpmp_response {
-		u_int8_t	 version;
-		u_int8_t	 opcode;
-		u_int16_t	 result;
-	};
-	struct natpmp_response	*r;
-
-	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
-	r = (struct natpmp_response *)packet;
-	memset(r, 0, sizeof(struct natpmp_response));
-
-	r->version = NATPMPD_MAX_VERSION;
-	r->opcode = opcode | 0x80;
-	r->result = result;
-
-	return (sizeof(struct natpmp_response));
-}
-
 void
 announce_address(int fd, short event, void *arg)
 {
 	struct natpmpd		*env = (struct natpmpd *)arg;
 	struct sockaddr_in	 sock;
 	u_int8_t		 packet[NATPMPD_MAX_PACKET_SIZE];
-	ssize_t			 len;
+	struct natpmp_response	*r;
 	struct listen_addr	*la;
 
 	/* Sending to 224.0.0.1:5350 */
@@ -259,12 +227,20 @@ announce_address(int fd, short event, void *arg)
 	sock.sin_port = htons(NATPMPD_CLIENT_PORT);
 
 	/* Create the address announce packet */
-	len = natpmp_address_packet(packet, env);
+	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
+	r = (struct natpmp_response *)packet;
+	memset(r, 0, sizeof(struct natpmp_response));
+
+	r->version = NATPMPD_MAX_VERSION;
+	r->opcode = 0x80;
+	r->result = NATPMPD_SUCCESS;
+	r->sssoe = htonl(sssoe(env));
+	r->data.announce.address = env->sc_address.s_addr;
 
 	/* Loop through all of our listening addresses and send the packet */
 	for (la = TAILQ_FIRST(&env->listen_addrs); la;
 	    la = TAILQ_NEXT(la, entry)) {
-		if (sendto(la->fd, packet, len, 0,
+		if (sendto(la->fd, packet, 12, 0,
 		    (struct sockaddr *)&sock, sizeof(sock)) < 0)
 			log_warn("sendto");
 	}
@@ -420,33 +396,16 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 }
 
 ssize_t
-natpmp_mapping(u_int8_t *packet, u_int8_t proto, struct sockaddr_in *rdr,
-    struct sockaddr_in *dst, u_int32_t lifetime, struct natpmpd *env)
+natpmp_mapping(struct natpmp_response *response, u_int8_t proto,
+    struct sockaddr_in *rdr, struct sockaddr_in *dst, u_int32_t lifetime,
+    struct natpmpd *env)
 {
-	struct natpmp_response {
-		u_int8_t		 version;
-		u_int8_t		 opcode;
-		u_int16_t		 result;
-		u_int32_t		 sssoe;
-		u_int16_t		 port[2];
-		u_int32_t		 lifetime;
-	};
-	struct natpmp_response		*r;
 	int				 count;
 	char				 rdr_ip[INET_ADDRSTRLEN];
 	char				 dst_ip[INET_ADDRSTRLEN];
 
-	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
-	r = (struct natpmp_response *)packet;
-	memset(r, 0, sizeof(struct natpmp_response));
-
 	inet_ntop(AF_INET, &rdr->sin_addr, rdr_ip, INET_ADDRSTRLEN);
 	inet_ntop(AF_INET, &dst->sin_addr, dst_ip, INET_ADDRSTRLEN);
-
-	r->version = NATPMPD_MAX_VERSION;
-	r->opcode = (proto == IPPROTO_UDP) ? 0x81 : 0x82;
-	r->result = NATPMPD_SUCCESS;
-	r->sssoe = htonl(sssoe(env));
 
 	log_info("%s request, %s:%d -> %s:%d, expires in %d seconds",
 	    (proto == IPPROTO_UDP) ? "UDP" : "TCP",
@@ -473,9 +432,9 @@ natpmp_mapping(u_int8_t *packet, u_int8_t proto, struct sockaddr_in *rdr,
 			count = natpmp_create_mapping(proto, rdr, dst,
 			    ntohl(lifetime));
 
-			r->port[0] = rdr->sin_port;
-			r->port[1] = dst->sin_port;
-			r->lifetime = lifetime;
+			response->data.mapping.port[0] = rdr->sin_port;
+			response->data.mapping.port[1] = dst->sin_port;
+			response->data.mapping.lifetime = lifetime;
 		} else {
 			/* Delete single mapping */
 			count = natpmp_remove_mapping(proto, rdr);
@@ -485,9 +444,9 @@ natpmp_mapping(u_int8_t *packet, u_int8_t proto, struct sockaddr_in *rdr,
 			else
 				log_info("mapping removed");
 
-			r->port[0] = rdr->sin_port;
-			r->port[1] = 0;
-			r->lifetime = 0;
+			response->data.mapping.port[0] = rdr->sin_port;
+			response->data.mapping.port[1] = 0;
+			response->data.mapping.lifetime = 0;
 		}
 	} else {
 		/* Delete all mappings */
@@ -495,16 +454,16 @@ natpmp_mapping(u_int8_t *packet, u_int8_t proto, struct sockaddr_in *rdr,
 
 		log_info("%d mappings removed", count);
 
-		r->port[0] = 0;
-		r->port[1] = 0;
-		r->lifetime = 0;
+		response->data.mapping.port[0] = 0;
+		response->data.mapping.port[1] = 0;
+		response->data.mapping.lifetime = 0;
 	}
 
 	if (count)
 		if (rebuild_rules() == -1)
 			log_warn("unable to rebuild ruleset");
 
-	return (sizeof(struct natpmp_response));
+	return (16);
 }
 
 void
@@ -515,49 +474,67 @@ natpmp_handler(int fd, short event, void *arg)
 	u_int8_t		 request_storage[NATPMPD_MAX_PACKET_SIZE];
 	u_int8_t		 response_storage[NATPMPD_MAX_PACKET_SIZE];
 	struct natpmp_request	*request;
+	struct natpmp_response	*response;
 	socklen_t		 slen;
 	ssize_t			 len;
 	struct sockaddr_in	 dst;
 	struct sockaddr_in	 rdr;
 	u_int8_t		 proto;
+	char			 src_ip[INET_ADDRSTRLEN];
 
 	slen = sizeof(ss);
 	if ((len = recvfrom(fd, request_storage, sizeof(request_storage), 0,
 	    (struct sockaddr *)&ss, &slen)) < 1 )
 		return;
 
+	inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, src_ip,
+	    INET_ADDRSTRLEN);
+
 	/* Need at least 2 bytes to be able to do anything useful */
 	if (len < 2)
 		return;
 
 	assert(sizeof(struct natpmp_request) <= NATPMPD_MAX_PACKET_SIZE);
+	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
 
 	request = (struct natpmp_request *)&request_storage;
+	response = (struct natpmp_response *)&response_storage;
+	response->version = NATPMPD_MAX_VERSION;
+	response->sssoe = htonl(sssoe(env));
 
 	/* No opcode in a request should be greater than 127 */
 	if (request->opcode & 0x80)
 		return;
 
 	if (request->version > NATPMPD_MAX_VERSION) {
-		len = natpmp_error_packet(response_storage, request->opcode,
-		    NATPMPD_BAD_VERSION);
-		len = sendto(fd, response_storage, len, 0, (struct sockaddr *)&ss, slen);
-		return;
-	}
+		log_warnx("ignoring version %d request from %s:%d",
+		    request->version, src_ip,
+		    ntohs(((struct sockaddr_in *)&ss)->sin_port));
 
-	/* We don't have an external address */
-	if (env->sc_address.s_addr == htonl(INADDR_ANY)) {
-		len = natpmp_error_packet(response_storage, request->opcode,
-		    NATPMPD_NETWORK_FAILURE);
-		len = sendto(fd, response_storage, len, 0,
+		response->opcode = 0;
+		response->result = NATPMPD_BAD_VERSION;
+		len = sendto(fd, response_storage, 8, 0,
 		    (struct sockaddr *)&ss, slen);
 		return;
 	}
 
+	/* We don't have an external address */
+	if (env->sc_address.s_addr == htonl(INADDR_ANY))
+		response->result = NATPMPD_NETWORK_FAILURE;
+	else
+		response->result = NATPMPD_SUCCESS;
+
 	proto = 0;
 	switch (request->opcode) {
 	case 0:
-		len = natpmp_address_packet(response_storage, env);
+		if (len != 2) {
+			log_warn("address request, expected 2 bytes, got %d",
+			    len);
+			return;
+		}
+
+		response->data.announce.address = env->sc_address.s_addr;
+		len = 12;
 		break;
 	case 1:
 		proto = IPPROTO_UDP;
@@ -565,6 +542,12 @@ natpmp_handler(int fd, short event, void *arg)
 	case 2:
 		if (proto == 0)
 			proto = IPPROTO_TCP;
+
+		if (len != 12) {
+			log_warn("mapping request, expected 12 bytes, got %d",
+			    len);
+			return;
+		}
 
 		memcpy(&rdr, &ss, sizeof(rdr));
 		memcpy(&rdr.sin_port, &request->port[0], sizeof(u_int16_t));
@@ -574,14 +557,18 @@ natpmp_handler(int fd, short event, void *arg)
 		dst.sin_addr = env->sc_address;
 		memcpy(&dst.sin_port, &request->port[1], sizeof(u_int16_t));
 
-		len = natpmp_mapping(response_storage, proto, &rdr, &dst,
+		len = natpmp_mapping(response, proto, &rdr, &dst,
 		    request->lifetime, env);
 		break;
 	default:
-		len = natpmp_error_packet(response_storage, request->opcode,
-		    NATPMPD_BAD_OPCODE);
+		/* Unsupported opcodes get the whole request returned */
+		memcpy(response, request, len);
+		response->result = NATPMPD_BAD_OPCODE;
 		break;
 	}
+
+	/* Set the MSB of the opcode to indicate a response */
+	response->opcode = request->opcode | 0x80;
 
 	len = sendto(fd, response_storage, len, 0, (struct sockaddr *)&ss, slen);
 }
