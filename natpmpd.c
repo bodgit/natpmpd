@@ -511,7 +511,7 @@ natpmp_handler(int fd, short event, void *arg)
 		    request->version, src_ip,
 		    ntohs(((struct sockaddr_in *)&ss)->sin_port));
 
-		response->opcode = 0;
+		response->opcode = 0x80;
 		response->result = NATPMPD_BAD_VERSION;
 		len = sendto(fd, response_storage, 8, 0,
 		    (struct sockaddr *)&ss, slen);
