@@ -1,7 +1,5 @@
-/*	$Id$ */
-
 /*
- * Copyright (c) 2010 Matt Dainty <matt@bodgit-n-scarper.com>
+ * Copyright (c) 2014 Matt Dainty <matt@bodgit-n-scarper.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above

@@ -1,5 +1,3 @@
-#	$Id$
-
 LOCALBASE?= /usr/local
 
 PROG=	natpmpd

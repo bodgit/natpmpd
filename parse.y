@@ -1,7 +1,5 @@
-/*	$Id$ */
-
 /*
- * Copyright (c) 2010 Matt Dainty <matt@bodgit-n-scarper.com>
+ * Copyright (c) 2014 Matt Dainty <matt@bodgit-n-scarper.com>
  * Copyright (c) 2007, 2008 Reyk Floeter <reyk@vantronix.net>
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
  * Copyright (c) 2004 Ryan McBride <mcbride@openbsd.org>
