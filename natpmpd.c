@@ -109,6 +109,10 @@ struct mapping {
 
 LIST_HEAD(, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
 
+struct in6_addr		 all_nodes = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
+struct sockaddr_in	 all_nodes4;
+struct sockaddr_in6	 all_nodes6;
+
 void
 handle_signal(int sig, short event, void *arg)
 {
@@ -213,16 +217,9 @@ void
 announce_address(int fd, short event, void *arg)
 {
 	struct natpmpd		*env = (struct natpmpd *)arg;
-	struct sockaddr_in	 sock;
 	u_int8_t		 packet[NATPMPD_MAX_PACKET_SIZE];
 	struct natpmp_response	*r;
 	struct listen_addr	*la;
-
-	/* Sending to 224.0.0.1:5350 */
-	memset(&sock, 0, sizeof(sock));
-	sock.sin_family = AF_INET;
-	sock.sin_addr.s_addr = htonl(INADDR_ALLHOSTS_GROUP);
-	sock.sin_port = htons(NATPMPD_CLIENT_PORT);
 
 	/* Create the address announce packet */
 	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
@@ -239,8 +236,10 @@ announce_address(int fd, short event, void *arg)
 	/* Loop through all of our listening addresses and send the packet */
 	for (la = TAILQ_FIRST(&env->listen_addrs); la;
 	    la = TAILQ_NEXT(la, entry)) {
+		if (la->sa.ss_family != AF_INET)
+			continue;
 		if (sendto(la->fd, packet, 12, 0,
-		    (struct sockaddr *)&sock, sizeof(sock)) < 0)
+		    (struct sockaddr *)&all_nodes4, sizeof(all_nodes4)) < 0)
 			log_warn("sendto");
 	}
 
@@ -648,6 +647,7 @@ main(int argc, char *argv[])
 	const char		*conffile = CONF_FILE;
 	u_int			 flags = 0;
 	unsigned char		 loop = 0;
+	unsigned int		 loop6 = 0;
 	struct passwd		*pw;
 	struct event		 rt_ev;
 	int			 rt_fd;
@@ -710,8 +710,25 @@ main(int argc, char *argv[])
 
 	gettimeofday(&env->sc_starttime, NULL);
 
+	/* Create the IPv4 announcement sockaddr used by both NAT-PMP & PCP */
+	memset(&all_nodes4, 0, sizeof(all_nodes4));
+	(&all_nodes4)->sin_family = AF_INET;
+	(&all_nodes4)->sin_len = sizeof(struct sockaddr_in);
+	(&all_nodes4)->sin_addr.s_addr = htonl(INADDR_ALLHOSTS_GROUP);
+	(&all_nodes4)->sin_port = htons(NATPMPD_CLIENT_PORT);
+
+	/* Create the IPv6 announcement sockaddr used by PCP only */
+	memset(&all_nodes6, 0, sizeof(all_nodes6));
+	(&all_nodes6)->sin6_family = AF_INET6;
+	(&all_nodes6)->sin6_len = sizeof(struct sockaddr_in6);
+	memcpy(&(&all_nodes6)->sin6_addr, &all_nodes, sizeof(all_nodes));
+	(&all_nodes6)->sin6_port = htons(NATPMPD_CLIENT_PORT);
+
 	/* Initialise the packet filter and clear out our anchor */
 	init_filter(NULL, NULL, 0);
+	/* Perhaps not fail here and instead return the correct
+	 * NATPMP_NOT_AUTHORISED and/or PCP_NOT_AUTHORISED
+	 */
 	if (rebuild_rules() == -1)
 		fatal("rebuild_rules");
 
@@ -723,6 +740,10 @@ main(int argc, char *argv[])
 				    htons(NATPMPD_SERVER_PORT);
 			break;
 		case AF_INET6:
+			if (((struct sockaddr_in6 *)&la->sa)->sin6_port == 0)
+				((struct sockaddr_in6 *)&la->sa)->sin6_port =
+				    htons(NATPMPD_SERVER_PORT);
+			break;
 		default:
 			fatalx("king bula sez: af borked");
 		}
@@ -737,14 +758,36 @@ main(int argc, char *argv[])
 		if (fcntl(la->fd, F_SETFL, O_NONBLOCK) == -1)
 			fatal("fcntl");
 
-		if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_IF,
-		    &(((struct sockaddr_in *)&la->sa)->sin_addr),
-		    sizeof(struct in_addr)) == -1)
-			fatal("setsockopt");
-
-		if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_LOOP,
-		    &loop, sizeof(loop)) == -1)
-			fatal("setsockopt");
+		switch (la->sa.ss_family) {
+		case AF_INET:
+			if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_IF,
+			    &(((struct sockaddr_in *)&la->sa)->sin_addr),
+			    sizeof(struct in_addr)) == -1)
+				fatal("setsockopt");
+			if (setsockopt(la->fd, IPPROTO_IP, IP_MULTICAST_LOOP,
+			    &loop, sizeof(loop)) == -1)
+				fatal("setsockopt");
+			break;
+		case AF_INET6:
+			/* If the scope ID is non-zero, this seems to be the
+			 * interface index which is required by the
+			 * IPV6_MULTICAST_IF socket option. Skip any address
+			 * which doesn't have a non-zero scope ID as otherwise
+			 * we can't easily work out which interface to send
+			 * the multicast announcements out of?
+			 */
+			if (setsockopt(la->fd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+			    &((struct sockaddr_in6 *)&la->sa)->sin6_scope_id,
+			    sizeof(((struct sockaddr_in6 *)&la->sa)->sin6_scope_id)) == -1)
+				fatal("setsockopt");
+			if (setsockopt(la->fd, IPPROTO_IPV6,
+			    IPV6_MULTICAST_LOOP, &loop6, sizeof(loop6)) == -1)
+				fatal("setsockopt");
+			break;
+		default:
+			/* NOTREACHED */
+			break;
+		}
 
 		if (bind(la->fd, (struct sockaddr *)&la->sa,
 		    SA_LEN((struct sockaddr *)&la->sa)) == -1) {
