@@ -31,6 +31,16 @@
 #define SALIGN			 (sizeof(long) - 1)
 #define SA_RLEN(sa)		 ((sa)->sa_len ? (((sa)->sa_len + SALIGN) & ~SALIGN) : (SALIGN + 1))
 
+#define	IN6ADDR_V4MAPPED_INIT \
+	{{{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+	    0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 }}}
+
+#define	IN6_IS_ADDR_V4MAPPED_ANY(a) \
+	((*(const u_int32_t *)(const void *)(&(a)->s6_addr[0]) == 0) && \
+	 (*(const u_int32_t *)(const void *)(&(a)->s6_addr[4]) == 0) && \
+	 (*(const u_int32_t *)(const void *)(&(a)->s6_addr[8]) == ntohl(0x0000ffff)) && \
+	 (*(const u_int32_t *)(const void *)(&(a)->s6_addr[12]) == 0))
+
 #define NATPMPD_USER		 "_natpmpd"
 #define CONF_FILE		 "/etc/natpmpd.conf"
 
@@ -80,10 +90,10 @@ struct natpmpd {
 #define NATPMPD_F_VERBOSE	 0x01;
 
 	const char		*sc_confpath;
-	struct in_addr		 sc_address;
+	struct in6_addr		 sc_address;
 	TAILQ_HEAD(listen_addrs, listen_addr)		 listen_addrs;
 	u_int8_t					 listen_all;
-	char		 	 sc_interface[IF_NAMESIZE];
+	char			 sc_interface[IF_NAMESIZE];
 	struct timeval		 sc_starttime;
 	int			 sc_delay;
 	struct event		 sc_announce_ev;

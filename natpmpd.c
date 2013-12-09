@@ -16,7 +16,6 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/ioctl.h>
 
 #include <netinet/in.h>
 
@@ -40,6 +39,7 @@
 #include <unistd.h>
 #include <assert.h>
 #include <pwd.h>
+#include <ifaddrs.h>
 
 #include "natpmpd.h"
 
@@ -233,7 +233,8 @@ announce_address(int fd, short event, void *arg)
 	r->opcode = 0x80;
 	r->result = NATPMPD_SUCCESS;
 	r->sssoe = htonl(sssoe(env));
-	r->data.announce.address = env->sc_address.s_addr;
+	r->data.announce.address =
+	    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
 
 	/* Loop through all of our listening addresses and send the packet */
 	for (la = TAILQ_FIRST(&env->listen_addrs); la;
@@ -517,7 +518,7 @@ natpmp_handler(int fd, short event, void *arg)
 	}
 
 	/* We don't have an external address */
-	if (env->sc_address.s_addr == htonl(INADDR_ANY))
+	if (IN6_IS_ADDR_V4MAPPED_ANY(&env->sc_address))
 		response->result = NATPMPD_NETWORK_FAILURE;
 	else
 		response->result = NATPMPD_SUCCESS;
@@ -531,7 +532,8 @@ natpmp_handler(int fd, short event, void *arg)
 			return;
 		}
 
-		response->data.announce.address = env->sc_address.s_addr;
+		response->data.announce.address =
+		    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
 		len = 12;
 		break;
 	case 1:
@@ -552,7 +554,8 @@ natpmp_handler(int fd, short event, void *arg)
 
 		memset(&dst, 0, sizeof(dst));
 		dst.sin_family = AF_INET;
-		dst.sin_addr = env->sc_address;
+		dst.sin_addr.s_addr =
+		    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
 		memcpy(&dst.sin_port, &request->port[1], sizeof(u_int16_t));
 
 		len = natpmp_mapping(response, proto, &rdr, &dst,
@@ -574,42 +577,50 @@ natpmp_handler(int fd, short event, void *arg)
 void
 check_interface(struct natpmpd *env)
 {
-	struct sockaddr_in	*ifaddr;
-	struct ifreq		 ifr;
-	int			 s;
+	struct ifaddrs	*ifaddr, *ifa;
+	struct in6_addr	 addr;
+	struct in6_addr  zero = IN6ADDR_V4MAPPED_INIT;
 
-	memset(&ifr, 0, sizeof(struct ifreq));
-	strncpy(ifr.ifr_name, env->sc_interface, IF_NAMESIZE);
+	if (getifaddrs(&ifaddr) == -1)
+		fatal("getifaddrs");
 
-	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
-		fatal("socket");
-
-	if (ioctl(s, SIOCGIFADDR, &ifr) == -1)
-		/* PPPoE device might not exist or be functional yet, etc. */
-		switch (errno) {
-		case ENXIO:
-			/* FALLTHROUGH */
-		case EADDRNOTAVAIL:
+	/* Breaks on the first address found on the interface
+	 * for the given address family
+	 */
+	for (ifa = ifaddr; ifa; ifa = ifa->ifa_next)
+		/* Interface name & address family matches */
+		if (strcmp(ifa->ifa_name, env->sc_interface) == 0
+		    && ifa->ifa_addr->sa_family == AF_INET)
 			break;
+
+	if (ifa)
+		/* Address found */
+		switch (ifa->ifa_addr->sa_family) {
+		case AF_INET:
+			/* Initialise the IPv6 address with the V4 mapped
+			 * pattern and then copy the IPv4 address into the
+			 * last 4 bytes
+			 */
+			memcpy(&addr, &zero, sizeof(struct in6_addr));
+			memcpy(&addr.s6_addr[12],
+			    &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr,
+			    sizeof(struct in_addr));
+			break;
+		case AF_INET6:
+			/* FALLTHROUGH */
 		default:
-			fatal("ioctl");
 			/* NOTREACHED */
+			break;
 		}
+	else
+		/* Address not found */
+		memcpy(&addr, &zero, sizeof(struct in6_addr));
 
-	close(s);
+	/* Primary address hasn't changed */
+	if (memcmp(&env->sc_address, &addr, sizeof(struct in6_addr)) == 0)
+		goto free;
 
-	if (ifr.ifr_addr.sa_family == AF_INET) {
-		ifaddr = (struct sockaddr_in *)&ifr.ifr_addr;
-
-		/* Primary address hasn't changed */
-		if (memcmp(&env->sc_address, &ifaddr->sin_addr,
-		    sizeof(struct in_addr)) == 0)
-			return;
-
-		memcpy(&env->sc_address, &ifaddr->sin_addr,
-		    sizeof(struct in_addr));
-	} else
-		env->sc_address.s_addr = htonl(INADDR_ANY);
+	memcpy(&env->sc_address, &addr, sizeof(struct in6_addr));
 
 	/* If the address changed again while we were still announcing the
 	 * old one, cancel the pending announcement before starting again
@@ -618,11 +629,14 @@ check_interface(struct natpmpd *env)
 		evtimer_del(&env->sc_announce_ev);
 
 	/* Don't announce an interface having 0.0.0.0 as an address */
-	if (env->sc_address.s_addr == htonl(INADDR_ANY))
-		return;
+	if (memcmp(&addr, &zero, sizeof(struct in6_addr)) == 0)
+		goto free;
 
 	env->sc_delay = 0;
 	evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
+
+free:
+	freeifaddrs(ifaddr);
 }
 
 int
