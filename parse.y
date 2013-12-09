@@ -494,6 +494,7 @@ parse_config(const char *filename, u_int flags)
 /* C&P */
 
 struct ntp_addr	*host_v4(const char *);
+struct ntp_addr	*host_v6(const char *);
 
 int
 host(const char *s, struct ntp_addr **hn)
@@ -507,6 +508,10 @@ host(const char *s, struct ntp_addr **hn)
 	/* IPv4 address? */
 	if (h == NULL)
 		h = host_v4(s);
+
+	/* IPv6 address? */
+	if (h == NULL)
+		h = host_v6(s);
 
 	if (h == NULL)
 		return (0);
@@ -537,6 +542,35 @@ host_v4(const char *s)
 	return (h);
 }
 
+struct ntp_addr *
+host_v6(const char *s)
+{
+	struct addrinfo		 hints, *res;
+	struct sockaddr_in6	*sa_in6;
+	struct ntp_addr		*h = NULL;
+
+	bzero(&hints, sizeof(hints));
+	hints.ai_family = AF_INET6;
+	hints.ai_socktype = SOCK_DGRAM;	/*dummy*/
+	hints.ai_flags = AI_NUMERICHOST;
+	if (getaddrinfo(s, "0", &hints, &res) == 0) {
+		if ((h = calloc(1, sizeof(struct ntp_addr))) == NULL)
+			fatal(NULL);
+		sa_in6 = (struct sockaddr_in6 *)&h->ss;
+		sa_in6->sin6_len = sizeof(struct sockaddr_in6);
+		sa_in6->sin6_family = AF_INET6;
+		memcpy(&sa_in6->sin6_addr,
+		    &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
+		    sizeof(sa_in6->sin6_addr));
+		sa_in6->sin6_scope_id =
+		    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
+
+		freeaddrinfo(res);
+	}
+
+	return (h);
+}
+
 #define MAX_SERVERS_DNS 8
 
 int
@@ -545,6 +579,7 @@ host_dns(const char *s, struct ntp_addr **hn)
 	struct addrinfo		 hints, *res0, *res;
 	int			 error, cnt = 0;
 	struct sockaddr_in	*sa_in;
+	struct sockaddr_in6	*sa_in6;
 	struct ntp_addr		*h, *hh = NULL;
 
 	bzero(&hints, sizeof(hints));
@@ -560,7 +595,8 @@ host_dns(const char *s, struct ntp_addr **hn)
 	}
 
 	for (res = res0; res && cnt < MAX_SERVERS_DNS; res = res->ai_next) {
-		if (res->ai_family != AF_INET)
+		if (res->ai_family != AF_INET &&
+		    res->ai_family != AF_INET6)
 			continue;
 		if ((h = calloc(1, sizeof(struct ntp_addr))) == NULL)
 			fatal(NULL);
@@ -570,6 +606,11 @@ host_dns(const char *s, struct ntp_addr **hn)
 			sa_in->sin_len = sizeof(struct sockaddr_in);
 			sa_in->sin_addr.s_addr = ((struct sockaddr_in *)
 			    res->ai_addr)->sin_addr.s_addr;
+		} else {
+			sa_in6 = (struct sockaddr_in6 *)&h->ss;
+			sa_in6->sin6_len = sizeof(struct sockaddr_in6);
+			memcpy(&sa_in6->sin6_addr, &((struct sockaddr_in6 *)
+			    res->ai_addr)->sin6_addr, sizeof(struct in6_addr));
 		}
 
 		h->next = hh;
