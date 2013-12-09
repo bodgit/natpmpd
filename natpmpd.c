@@ -43,6 +43,11 @@
 
 #include "natpmpd.h"
 
+struct common_header {
+	u_int8_t		 version;
+	u_int8_t		 opcode;
+};
+
 struct natpmp_request {
 	u_int8_t		 version;
 	u_int8_t		 opcode;
@@ -75,13 +80,17 @@ struct mapping	*init_mapping(void);
 void		 expire_mapping(int, short, void *);
 void		 announce_address(int, short, void *);
 void		 route_handler(int, short, void *);
+void		 common_handler(int, short, void *);
 int		 natpmp_remove_mapping(u_int8_t, struct sockaddr_in *);
 int		 natpmp_create_mapping(u_int8_t, struct sockaddr_in *,
 		     struct sockaddr_in *, u_int32_t);
 ssize_t		 natpmp_mapping(struct natpmp_response *, u_int8_t,
 		     struct sockaddr_in *, struct sockaddr_in *, u_int32_t,
 		     struct natpmpd *);
-void		 natpmp_handler(int, short, void *);
+void		 natpmp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
+		     struct sockaddr *);
+void		 pcp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
+		     struct sockaddr *);
 void		 check_interface(struct natpmpd *);
 int		 rebuild_rules(void);
 u_int32_t	 sssoe(struct natpmpd *);
@@ -276,8 +285,8 @@ route_handler(int fd, short event, void *arg)
 		/* We only care about matching the interface name */
 		for (i = 1; ifam->ifam_addrs && i <= RTA_IFP; i <<= 1)
 			if (i & ifam->ifam_addrs) {
-				if (i == RTA_IFP && (strcmp(env->sc_interface,
-				    ((struct sockaddr_dl *)cp)->sdl_data) == 0))
+				if (i == RTA_IFP && strcmp(env->sc_interface,
+				    ((struct sockaddr_dl *)cp)->sdl_data) == 0)
 					check_interface(env);
 				cp += SA_RLEN((struct sockaddr *)cp);
 			}
@@ -285,13 +294,48 @@ route_handler(int fd, short event, void *arg)
 	case RTM_IFANNOUNCE:
 		ifan = (struct if_announcemsghdr *)rtm;
 		/* Interface got destroyed (PPPoE, etc.) */
-		if ((ifan->ifan_what == IFAN_DEPARTURE)
-		    && (strcmp(env->sc_interface, ifan->ifan_name) == 0))
+		if (ifan->ifan_what == IFAN_DEPARTURE
+		    && strcmp(env->sc_interface, ifan->ifan_name) == 0)
 			check_interface(env);
 		break;
 	default:
 		return;
 		/* NOTREACHED */
+	}
+}
+
+void
+common_handler(int fd, short event, void *arg)
+{
+	struct natpmpd		*env = (struct natpmpd *)arg;
+	struct sockaddr_storage	 ss;
+	u_int8_t		 request[NATPMPD_MAX_PACKET_SIZE+1];
+	struct common_header	*header = (struct common_header *)&request;
+	socklen_t		 slen;
+	ssize_t			 len;
+
+	slen = sizeof(ss);
+	if ((len = recvfrom(fd, request, sizeof(request), 0,
+	    (struct sockaddr *)&ss, &slen)) < 1 )
+		return;
+
+	/* Need at least 2 bytes to be able to do anything useful */
+	if ((size_t)len < sizeof(struct common_header))
+		return;
+
+	/* No opcode in a request should be greater than 127 */
+	if (header->opcode & 0x80)
+		return;
+
+	switch (header->version) {
+	case 0:
+		/* NAT-PMP */
+		natpmp_handler(env, fd, request, len, (struct sockaddr *)&ss);
+		break;
+	default:
+		/* PCP */
+		pcp_handler(env, fd, request, len, (struct sockaddr *)&ss);
+		break;
 	}
 }
 
@@ -465,54 +509,37 @@ natpmp_mapping(struct natpmp_response *response, u_int8_t proto,
 }
 
 void
-natpmp_handler(int fd, short event, void *arg)
+natpmp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
+    ssize_t len, struct sockaddr *sock)
 {
-	struct natpmpd		*env = (struct natpmpd *)arg;
-	struct sockaddr_storage	 ss;
-	u_int8_t		 request_storage[NATPMPD_MAX_PACKET_SIZE];
-	u_int8_t		 response_storage[NATPMPD_MAX_PACKET_SIZE];
 	struct natpmp_request	*request;
 	struct natpmp_response	*response;
-	socklen_t		 slen;
-	ssize_t			 len;
+	u_int8_t		 response_storage[NATPMP_MAX_PACKET_SIZE];
 	struct sockaddr_in	 dst;
 	struct sockaddr_in	 rdr;
 	u_int8_t		 proto;
-	char			 src_ip[INET_ADDRSTRLEN];
 
-	slen = sizeof(ss);
-	if ((len = recvfrom(fd, request_storage, sizeof(request_storage), 0,
-	    (struct sockaddr *)&ss, &slen)) < 1 )
-		return;
-
-	inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, src_ip,
-	    INET_ADDRSTRLEN);
-
-	/* Need at least 2 bytes to be able to do anything useful */
-	if (len < 2)
+	/* Ignore NAT-PMP received over IPv6 */
+	if (sock->sa_family != AF_INET)
 		return;
 
 	assert(sizeof(struct natpmp_request) <= NATPMPD_MAX_PACKET_SIZE);
 	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
 
-	request = (struct natpmp_request *)&request_storage;
+	request = (struct natpmp_request *)request_storage;
 	response = (struct natpmp_response *)&response_storage;
 	response->version = NATPMPD_MAX_VERSION;
 	response->sssoe = htonl(sssoe(env));
 
-	/* No opcode in a request should be greater than 127 */
-	if (request->opcode & 0x80)
-		return;
-
-	if (request->version > NATPMPD_MAX_VERSION) {
-		log_warnx("ignoring version %d request from %s:%d",
-		    request->version, src_ip,
-		    ntohs(((struct sockaddr_in *)&ss)->sin_port));
+	if (request->version > NATPMP_MAX_VERSION) {
+		log_warnx("bad version %d request from %s:%d",
+		    request->version, log_sockaddr(sock),
+		    ntohs(((struct sockaddr_in *)sock)->sin_port));
 
 		response->opcode = 0x80;
 		response->result = NATPMP_UNSUPP_VERSION;
 		len = sendto(fd, response_storage, 8, 0,
-		    (struct sockaddr *)&ss, slen);
+		    (struct sockaddr *)sock, SA_LEN((struct sockaddr *)sock));
 		return;
 	}
 
@@ -548,7 +575,7 @@ natpmp_handler(int fd, short event, void *arg)
 			return;
 		}
 
-		memcpy(&rdr, &ss, sizeof(rdr));
+		memcpy(&rdr, sock, sizeof(rdr));
 		memcpy(&rdr.sin_port, &request->port[0], sizeof(u_int16_t));
 
 		memset(&dst, 0, sizeof(dst));
@@ -557,6 +584,9 @@ natpmp_handler(int fd, short event, void *arg)
 		    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
 		memcpy(&dst.sin_port, &request->port[1], sizeof(u_int16_t));
 
+		/* FIXME work out here if rebuild_rules() failed so we can
+		 * potentially return NATPMP_NOT_AUTHORISED
+		 */
 		len = natpmp_mapping(response, proto, &rdr, &dst,
 		    request->lifetime, env);
 		break;
@@ -570,7 +600,14 @@ natpmp_handler(int fd, short event, void *arg)
 	/* Set the MSB of the opcode to indicate a response */
 	response->opcode = request->opcode | 0x80;
 
-	len = sendto(fd, response_storage, len, 0, (struct sockaddr *)&ss, slen);
+	len = sendto(fd, response_storage, len, 0, (struct sockaddr *)sock,
+	    SA_LEN((struct sockaddr *)sock));
+}
+
+void
+pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
+    ssize_t len, struct sockaddr *sock)
+{
 }
 
 void
@@ -840,7 +877,7 @@ main(int argc, char *argv[])
 
 	for (la = TAILQ_FIRST(&env->listen_addrs); la; ) {
 		event_set(&la->ev, la->fd, EV_READ|EV_PERSIST,
-		    natpmp_handler, env);
+		    common_handler, env);
 		event_add(&la->ev, NULL);
 		la = TAILQ_NEXT(la, entry);
 	}
