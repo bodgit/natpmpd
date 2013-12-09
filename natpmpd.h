@@ -28,8 +28,9 @@
 #include <event.h>
 #include <netdb.h>
 
-#define SALIGN			 (sizeof(long) - 1)
-#define SA_RLEN(sa)		 ((sa)->sa_len ? (((sa)->sa_len + SALIGN) & ~SALIGN) : (SALIGN + 1))
+#define	SALIGN				 (sizeof(long) - 1)
+#define	SA_RLEN(sa) \
+	((sa)->sa_len ? (((sa)->sa_len + SALIGN) & ~SALIGN) : (SALIGN + 1))
 
 #define	IN6ADDR_V4MAPPED_INIT \
 	{{{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
@@ -41,26 +42,69 @@
 	 (*(const u_int32_t *)(const void *)(&(a)->s6_addr[8]) == ntohl(0x0000ffff)) && \
 	 (*(const u_int32_t *)(const void *)(&(a)->s6_addr[12]) == 0))
 
-#define NATPMPD_USER		 "_natpmpd"
-#define CONF_FILE		 "/etc/natpmpd.conf"
+#define	NATPMPD_USER			 "_natpmpd"
+#define	CONF_FILE			 "/etc/natpmpd.conf"
 
-#define NATPMPD_SERVER_PORT 	 5351
-#define NATPMPD_CLIENT_PORT	 5350
+#define	NATPMPD_SERVER_PORT		 5351
+#define	NATPMPD_CLIENT_PORT		 5350
 
-#define NATPMPD_ANCHOR		 "natpmpd"
+#define	NATPMPD_ANCHOR			 "natpmpd"
 
-#define NATPMPD_MAX_VERSION	 0
+#define	NATPMP_MIN_VERSION		 0
+#define	NATPMP_MAX_VERSION		 0
 
-#define NATPMPD_SUCCESS		 0
-#define NATPMPD_BAD_VERSION	 1
-#define NATPMPD_NOT_AUTHORISED	 2
-#define NATPMPD_NETWORK_FAILURE	 3
-#define NATPMPD_NO_RESOURCES	 4
-#define NATPMPD_BAD_OPCODE	 5
+#define	NATPMP_SUCCESS			 0
+#define	NATPMP_UNSUPP_VERSION		 1
+#define	NATPMP_NOT_AUTHORISED		 2
+#define	NATPMP_NETWORK_FAILURE		 3
+#define	NATPMP_NO_RESOURCES		 4
+#define	NATPMP_UNSUPP_OPCODE		 5
 
-#define NATPMPD_MAX_DELAY	 10
+#define	NATPMP_MAX_PACKET_SIZE		 16
 
-#define NATPMPD_MAX_PACKET_SIZE	 16
+#define	NATPMP_OPCODE_ANNOUNCE		 0
+#define	NATPMP_OPCODE_MAP_UDP		 1
+#define	NATPMP_OPCODE_MAP_TCP		 2
+
+#define	PCP_MIN_VERSION			 2
+#define	PCP_MAX_VERSION			 2
+
+#define	PCP_SUCCESS			 0
+#define	PCP_UNSUPP_VERSION		 1
+#define	PCP_NOT_AUTHORISED		 2
+#define	PCP_MALFORMED_REQUEST		 3
+#define	PCP_UNSUPP_OPCODE		 4
+#define	PCP_UNSUPP_OPTION		 5
+#define	PCP_MALFORMED_OPTION		 6
+#define	PCP_NETWORK_FAILURE		 7
+#define	PCP_NO_RESOURCES		 8
+#define	PCP_UNSUPP_PROTOCOL		 9
+#define	PCP_USER_EX_QUOTA		 10
+#define	PCP_CANNOT_PROVIDE_EXTERNAL	 11
+#define	PCP_ADDRESS_MISMATCH		 12
+#define	PCP_EXCESSIVE_REMOTE_PEERS	 13
+#define	PCP_UNSUPP_FAMILY		 14
+
+#define	PCP_SHORT_LIFETIME		 (htonl(30))
+#define	PCP_LONG_LIFETIME		 (htonl(1800))
+
+#define	PCP_MAX_PACKET_SIZE		 1100
+
+#define	PCP_OPCODE_ANNOUNCE		 0
+#define	PCP_OPCODE_MAP			 1
+#define	PCP_OPCODE_PEER			 2
+
+#define	PCP_OPTION_THIRD_PARTY		 1
+#define	PCP_OPTION_PREFER_FAILURE	 2
+#define	PCP_OPTION_FILTER		 3
+
+#define	NATPMPD_MAX_DELAY		 10
+
+#define	NATPMPD_MAX_VERSION \
+	MAX(NATPMP_MAX_VERSION, PCP_MAX_VERSION)
+
+#define	NATPMPD_MAX_PACKET_SIZE \
+	MAX(NATPMP_MAX_PACKET_SIZE, PCP_MAX_PACKET_SIZE)
 
 struct address {
 	struct sockaddr_storage	 ss;

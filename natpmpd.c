@@ -231,7 +231,7 @@ announce_address(int fd, short event, void *arg)
 
 	r->version = NATPMPD_MAX_VERSION;
 	r->opcode = 0x80;
-	r->result = NATPMPD_SUCCESS;
+	r->result = NATPMP_SUCCESS;
 	r->sssoe = htonl(sssoe(env));
 	r->data.announce.address =
 	    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
@@ -511,7 +511,7 @@ natpmp_handler(int fd, short event, void *arg)
 		    ntohs(((struct sockaddr_in *)&ss)->sin_port));
 
 		response->opcode = 0x80;
-		response->result = NATPMPD_BAD_VERSION;
+		response->result = NATPMP_UNSUPP_VERSION;
 		len = sendto(fd, response_storage, 8, 0,
 		    (struct sockaddr *)&ss, slen);
 		return;
@@ -519,13 +519,13 @@ natpmp_handler(int fd, short event, void *arg)
 
 	/* We don't have an external address */
 	if (IN6_IS_ADDR_V4MAPPED_ANY(&env->sc_address))
-		response->result = NATPMPD_NETWORK_FAILURE;
+		response->result = NATPMP_NETWORK_FAILURE;
 	else
-		response->result = NATPMPD_SUCCESS;
+		response->result = NATPMP_SUCCESS;
 
 	proto = 0;
 	switch (request->opcode) {
-	case 0:
+	case NATPMP_OPCODE_ANNOUNCE:
 		if (len != 2) {
 			log_warn("address request, expected 2 bytes, got %d",
 			    len);
@@ -536,10 +536,10 @@ natpmp_handler(int fd, short event, void *arg)
 		    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
 		len = 12;
 		break;
-	case 1:
+	case NATPMP_OPCODE_MAP_UDP:
 		proto = IPPROTO_UDP;
 		/* FALLTHROUGH */
-	case 2:
+	case NATPMP_OPCODE_MAP_TCP:
 		if (proto == 0)
 			proto = IPPROTO_TCP;
 
@@ -564,7 +564,7 @@ natpmp_handler(int fd, short event, void *arg)
 	default:
 		/* Unsupported opcodes get the whole request returned */
 		memcpy(response, request, len);
-		response->result = NATPMPD_BAD_OPCODE;
+		response->result = NATPMP_UNSUPP_OPCODE;
 		break;
 	}
 
