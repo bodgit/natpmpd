@@ -18,14 +18,14 @@
 .Os
 .Sh NAME
 .Nm natpmpd
-.Nd NAT-PMP daemon
+.Nd NAT-PMP & PCP daemon
 .Sh SYNOPSIS
 .Nm natpmpd
 .Op Fl dnv
 .Op Fl f Ar file
 .Sh DESCRIPTION
 .Nm
-is a daemon which implements the NAT-PMP protocol.
+is a daemon which implements both the NAT-PMP and PCP protocols.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
@@ -68,6 +68,11 @@ configuration file
 .%T "NAT Port Mapping Protocol (NAT-PMP)"
 .%D April 2013
 .Re
+.Rs
+.%R RFC 6887
+.%T "Port Control Protocol (PCP)"
+.%D April 2013
+.Re
 .Sh CAVEATS
 .Xr pf 4
 does not allow the ruleset to be modified if the system is running at a
@@ -75,9 +80,16 @@ does not allow the ruleset to be modified if the system is running at a
 higher than 1.
 At that level
 .Nm
-cannot add rules to the anchors and NAT-PMP requests will not work.
+cannot add rules to the anchors and neither NAT-PMP nor PCP requests will work.
 .Sh AUTHORS
 The
 .Nm
 program was written by
 .An Matt Dainty Aq matt@bodgit-n-scarper.com .
+.Sh BUGS
+IPv6 PCP support is currently unimplemented although
+.Nm
+will correctly reject such requests.
+.Pp
+Support for the PCP PEER opcode is unimplemented as well as any PCP MAP opcode
+which attempts to map anything other than individual TCP or UDP ports.

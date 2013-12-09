@@ -18,7 +18,7 @@
 .Os
 .Sh NAME
 .Nm natpmpd.conf
-.Nd NAT-PMP daemon configuration file
+.Nd NAT-PMP & PCP daemon configuration file
 .Sh DESCRIPTION
 .Nm
 is the configuration file for the
@@ -50,6 +50,8 @@ This will be monitored for changes to the address.
 Specify the local address
 .Xr natpmpd 8
 should listen on for incoming mapping requests.
+This should be the address that hosts use as their default gateway.
+Repeat for each internal network as necessary.
 .El
 .Sh FILES
 .Bl -tag -compact
