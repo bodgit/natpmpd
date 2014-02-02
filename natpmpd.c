@@ -43,6 +43,14 @@
 
 #include "natpmpd.h"
 
+struct mapping {
+	u_int32_t		 proto;
+	struct sockaddr		 dst;
+	struct sockaddr		 rdr;
+	struct event		 ev;
+	LIST_ENTRY(mapping)	 entry;
+};
+
 struct common_header {
 	u_int8_t		 version;
 	u_int8_t		 opcode;
@@ -72,6 +80,83 @@ struct natpmp_response {
 			u_int32_t	 lifetime;
 		} mapping;
 	} data;
+};
+
+/* Common PCP header */
+struct pcp_header {
+	u_int8_t		 version;
+	u_int8_t		 opcode;
+	u_int8_t		 reserved;
+	u_int8_t		 result;
+	u_int32_t		 lifetime;
+	union {
+		struct in6_addr	 addr;
+		u_int32_t	 sssoe;
+	} data;
+};
+
+/* MAP opcode has this struct following the header */
+struct pcp_map {
+	u_int8_t		 nonce[12];
+	u_int8_t		 protocol;
+	u_int8_t		 reserved[3];
+	u_int16_t		 port[2];
+	struct in6_addr		 addr;
+};
+
+/* PEER opcode has this struct following the MAP opcode */
+struct pcp_peer {
+	u_int16_t		 port;
+	u_int16_t		 reserved;
+	struct in6_addr		 addr;
+};
+
+/* Common PCP option header */
+struct pcp_option_header {
+	u_int8_t		 code;
+	u_int8_t		 reserved;
+	u_int16_t		 length;
+};
+
+/* FILTER option has this struct following the header */
+struct pcp_option_filter {
+	u_int8_t		 reserved;
+	u_int8_t		 prefix;
+	u_int16_t		 port;
+	struct in6_addr		 addr;
+};
+
+/* List of trusted third parties */
+struct pcp_third_party {
+	struct in6_addr			 addr;
+	TAILQ_ENTRY(pcp_third_party)	 entry;
+};
+
+struct pcp_filter {
+	u_int8_t		 prefix;
+	u_int16_t		 port;
+	struct in6_addr		 addr;
+	TAILQ_ENTRY(pcp_filter)	 entry;
+};
+
+TAILQ_HEAD(pcp_filters, pcp_filter);
+
+struct pcp_option {
+	struct pcp_option_header		*header;
+	union {
+		u_int8_t			*raw;
+		struct in6_addr			*addr;
+		struct pcp_option_filter	*filter;
+	} data;
+	TAILQ_ENTRY(pcp_option)			 entry;
+};
+
+struct pcp_option_rule {
+	unsigned int	 code;	/* Option code */
+	unsigned int	 min;	/* Minimum length */
+	unsigned int	 max;	/* Maximum length */
+	unsigned int	 count;	/* Maximum number of occurences */
+	unsigned int	 valid;	/* Bitmask of valid opcodes */
 };
 
 void		 handle_signal(int, short, void *);
@@ -108,15 +193,17 @@ struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{ 64,      0 },
 };
 
-struct mapping {
-	u_int32_t		 proto;
-	struct sockaddr		 dst;
-	struct sockaddr		 rdr;
-	struct event		 ev;
-	LIST_ENTRY(mapping)	 entry;
-};
-
 LIST_HEAD(, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
+
+/* XXX This (empty) list should move elsewhere eventually */
+TAILQ_HEAD(, pcp_third_party) third_party = TAILQ_HEAD_INITIALIZER(third_party);
+
+/* Table of supported PCP options */
+struct pcp_option_rule pcp_options[] = {
+	{ PCP_OPTION_THIRD_PARTY,    16, 16, 1, 0x06 },
+	{ PCP_OPTION_PREFER_FAILURE,  0,  0, 1, 0x02 },
+	{ PCP_OPTION_FILTER,         20, 20, 0, 0x02 },
+};
 
 struct in6_addr		 all_nodes = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
 struct sockaddr_in	 all_nodes4;
