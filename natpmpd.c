@@ -695,6 +695,313 @@ void
 pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
     ssize_t len, struct sockaddr *sock)
 {
+	struct pcp_header		*request = (struct pcp_header *)request_storage;
+	struct pcp_map			*map = NULL;
+#if 0
+	struct pcp_peer			*peer;
+#endif
+	struct pcp_option_header	*oh;
+	struct pcp_option		*option;
+	TAILQ_HEAD(, pcp_option)	 options = TAILQ_HEAD_INITIALIZER(options);
+	struct pcp_third_party		*tp;
+	struct pcp_filter		*filter;
+	struct pcp_filters		 filters = TAILQ_HEAD_INITIALIZER(filters);
+	u_int8_t			 response_storage[PCP_MAX_PACKET_SIZE];
+	struct pcp_header		*response = (struct pcp_header *)response_storage;
+	struct in6_addr			 dst_addr = IN6ADDR_V4MAPPED_INIT, src_addr;
+	size_t				 opcode, remaining, optlen;
+	unsigned int			 counts[nitems(pcp_options)], i, flags = 0;
+	u_int16_t			 src_port;
+	u_int32_t			 lifetime;
+	u_int8_t			 nonce[12];
+
+	memset(response_storage, 0, sizeof(response_storage));
+	memcpy(response_storage, request_storage,
+	    (len < PCP_MAX_PACKET_SIZE) ? len : PCP_MAX_PACKET_SIZE);
+	response->opcode |= 0x80;
+	response->reserved = 0;
+	response->lifetime = PCP_LONG_LIFETIME;
+	(&response->data)->sssoe = htonl(sssoe(env));
+
+	/* Version negotiation */
+	if (request->version < PCP_MIN_VERSION ||
+	    request->version > PCP_MAX_VERSION) {
+		log_debug("unsupported version");
+		response->version = MAX(MIN(request->version,
+		    PCP_MAX_VERSION), PCP_MIN_VERSION);
+		response->result = PCP_UNSUPP_VERSION;
+		goto send;
+	}
+
+	/* Less than 24 octets */
+	if ((size_t)len < sizeof(struct pcp_header))
+		return;
+
+	/* Exceed 1100 octets or not a multiple of 4 octets */
+	if (len > PCP_MAX_PACKET_SIZE || len % 4) {
+		log_debug("malformed request");
+		response->result = PCP_MALFORMED_REQUEST;
+		goto send;
+	}
+
+	/* Grab the source address from the sending sockaddr */
+	if (sock->sa_family == AF_INET)
+		memcpy(&dst_addr.s6_addr[12],
+		    &((struct sockaddr_in *)sock)->sin_addr,
+		    sizeof(struct in_addr));
+	else
+		memcpy(&dst_addr, &((struct sockaddr_in6 *)sock)->sin6_addr,
+		    sizeof(struct in6_addr));
+
+	/* There's a NAT in the way */
+	if (memcmp(&dst_addr, &(&request->data)->addr,
+	    sizeof(struct in6_addr)) != 0) {
+		log_debug("address mismatch");
+		response->result = PCP_ADDRESS_MISMATCH;
+		goto send;
+	}
+
+	log_debug("version %d, opcode %d, size %d, lifetime %d from %s",
+	    request->version, request->opcode, len, ntohl(request->lifetime),
+	    log_sockaddr(sock));
+
+	/* Calculate opcode size and set up pointers */
+	switch (request->opcode) {
+	case PCP_OPCODE_ANNOUNCE:
+		opcode = sizeof(struct pcp_header);
+		break;
+	case PCP_OPCODE_MAP:
+		opcode = sizeof(struct pcp_header) + sizeof(struct pcp_map);
+		map = (struct pcp_map *)(request_storage + sizeof(struct pcp_header));
+		break;
+#if 0
+	case PCP_OPCODE_PEER:
+		opcode = sizeof(struct pcp_header) + sizeof(struct pcp_map)
+		    + sizeof(struct pcp_peer);
+		map = (struct pcp_map *)(request_storage
+		    + sizeof(struct pcp_header));
+		peer = (struct pcp_peer *)(request_storage
+		    + sizeof(struct pcp_header) + sizeof(struct pcp_map));
+		break;
+#endif
+	default:
+		log_debug("unsupported opcode");
+		response->result = PCP_UNSUPP_OPCODE;
+		goto send;
+		/* NOTREACHED */
+	}
+
+	/* Not enough octets for the opcode */
+	if ((size_t)len < opcode) {
+		log_debug("malformed request");
+		response->result = PCP_MALFORMED_REQUEST;
+		goto send;
+	}
+
+	/* Are there options? */
+	remaining = len - opcode;
+	if (remaining) {
+		log_debug("options");
+		oh = (struct pcp_option_header *)(request_storage + opcode);
+		while (remaining) {
+			/* Not enough room for option header? */
+			if (remaining < sizeof(struct pcp_option_header)) {
+				log_debug("malformed option");
+				response->result = PCP_MALFORMED_OPTION;
+				goto send;
+			}
+			remaining -= sizeof(struct pcp_option_header);
+
+			/* Calculate option data length, (rounding up
+			 * to the nearest whole 4 octets)
+			 */
+			optlen = (ntohs(oh->length) + 3) & ~0x03;
+
+			/* Not enough room for option data? */
+			if (remaining < optlen) {
+				log_debug("malformed option");
+				response->result = PCP_MALFORMED_OPTION;
+				goto send;
+			}
+			remaining -= optlen;
+
+			/* Find this option in our supported options */
+			for (i = 0; i < nitems(pcp_options) &&
+			    (oh->code & 0x7f) != (&pcp_options[i])->code; i++);
+
+			/* We dropped off the end of the list and the option
+			 * is unimplemented and mandatory, or the option is
+			 * not valid for this opcode
+			 *
+			 * XXX Not quite sure what to return for the latter
+			 */
+			if ((i == nitems(pcp_options) && oh->code < 0x80) ||
+			    !((&pcp_options[i])->valid & (1 << request->opcode))) {
+				log_debug("unsupp option");
+				response->result = PCP_UNSUPP_OPTION;
+				goto send;
+			}
+
+			/* Track how many times we've seen this option,
+			 * mandatory or optional
+			 */
+			counts[i]++;
+
+			/* Option appears more times than it should or is the
+			 * wrong size
+			 */
+			if (((&pcp_options[i])->count &&
+			    counts[i] > (&pcp_options[i])->count) ||
+			    (ntohs(oh->length) < (&pcp_options[i])->min) ||
+			    (ntohs(oh->length) > (&pcp_options[i])->max)) {
+				log_debug("malformed options");
+				response->result = PCP_MALFORMED_OPTION;
+				goto send;
+			}
+
+			/* Create list entry pointing to the option */
+			if ((option = calloc(1, sizeof(struct pcp_option))) == NULL) {
+				log_debug("no resources");
+				response->result = PCP_NO_RESOURCES;
+				response->lifetime = PCP_SHORT_LIFETIME;
+				goto send;
+			}
+
+			option->header = oh;
+			(&option->data)->raw = (optlen) ? (u_int8_t *)oh + sizeof(struct pcp_option_header) : NULL;
+
+			log_debug("option %d, length %d", oh->code & 0x7f,
+			    ntohs(oh->length));
+
+			TAILQ_INSERT_TAIL(&options, option, entry);
+
+			/* Advance to next option */
+			oh += sizeof(struct pcp_option_header) + optlen;
+		}
+	}
+
+	/* Now that we've sifted out and errored on options we don't support,
+	 * iterate over the options we do
+	 */
+	for (option = TAILQ_FIRST(&options); option;
+	    option = TAILQ_NEXT(option, entry))
+		switch (option->header->code) {
+		case PCP_OPTION_THIRD_PARTY:
+			/* Address in option matches the source address */
+			if (memcmp(&dst_addr, (&option->data)->addr,
+			    sizeof(struct in6_addr)) == 0) {
+				response->result = PCP_MALFORMED_REQUEST;
+				goto send;
+			}
+
+			/* Search through list of trusted addresses */
+			for (tp = TAILQ_FIRST(&third_party); tp &&
+			    memcmp((&option->data)->addr, &tp->addr,
+			    sizeof(struct in6_addr)); tp = TAILQ_NEXT(tp, entry));
+
+			if (tp == NULL) {
+				response->result = PCP_UNSUPP_OPTION;
+				goto send;
+			}
+
+			memcpy(&dst_addr, (&option->data)->addr,
+			    sizeof(struct in6_addr));
+
+			break;
+		case PCP_OPTION_PREFER_FAILURE:
+			flags |= (1 << PCP_OPTION_PREFER_FAILURE);
+			break;
+		case PCP_OPTION_FILTER:
+			/* Invalid prefix length */
+			if ((IN6_IS_ADDR_V4MAPPED(&(&option->data)->filter->addr) &&
+			    (&option->data)->filter->prefix &&
+			    (&option->data)->filter->prefix < 96) ||
+			    (&option->data)->filter->prefix > 128) {
+				response->result = PCP_MALFORMED_OPTION;
+				goto send;
+			}
+
+			if ((filter = calloc(1, sizeof(struct pcp_filter))) == NULL) {
+				log_debug("no resources");
+				response->result = PCP_NO_RESOURCES;
+				response->lifetime = PCP_SHORT_LIFETIME;
+				goto send;
+			}
+
+			filter->prefix = (&option->data)->filter->prefix;
+			filter->port = (&option->data)->filter->port;
+			memcpy(&filter->addr, &(&option->data)->filter->addr,
+			    sizeof(struct in6_addr));
+
+			TAILQ_INSERT_TAIL(&filters, filter, entry);
+
+			break;
+		default:
+			fatalx("unimplemented option");
+			/* NOTREACHED */
+		}
+	
+	switch (request->opcode) {
+	case PCP_OPCODE_ANNOUNCE:
+		break;
+	case PCP_OPCODE_MAP:
+		/* Make copies of the things that may get changed */
+		memcpy(&src_addr, &map->addr, sizeof(struct in6_addr));
+		memcpy(&nonce, &map->nonce, sizeof(nonce));
+		src_port = ntohs(map->port[1]);
+		lifetime = ntohl(request->lifetime);
+
+#if 0
+		if ((response->result = pcp_map(map->protocol, dst_addr,
+		    ntohs(map->port[0]), &src_addr, &src_port, &lifetime,
+		    nonce, flags, &filters)) != PCP_SUCCESS)
+			goto send;
+#endif
+
+		/* Success, build up response packet */
+
+		break;
+	case PCP_OPCODE_PEER:
+		break;
+	default:
+		break;
+	}
+
+	/* FIXME */
+	return;
+
+	if (response->result != PCP_SUCCESS)
+		fatalx("error without goto");
+
+	/* Append all of the options in the list to the response as we will
+	 * have acted upon them
+	 */
+	while ((option = TAILQ_FIRST(&options))) {
+		
+		TAILQ_REMOVE(&options, option, entry);
+		free(option);
+	}
+
+send:
+	/* Clean up any options */
+	while ((option = TAILQ_FIRST(&options))) {
+		TAILQ_REMOVE(&options, option, entry);
+		free(option);
+	}
+
+	/* Clean up any filters */
+	while ((filter = TAILQ_FIRST(&filters))) {
+		TAILQ_REMOVE(&filters, filter, entry);
+		free(filter);
+	}
+
+	/* In case of sending back a malformed packet, round up to the nearest
+	 * whole 4 octets
+	 */
+	len = (len + 3) & ~0x03;
+
+	len = sendto(fd, response_storage, len, 0, (struct sockaddr *)sock,
+	    SA_LEN((struct sockaddr *)sock));
 }
 
 void
