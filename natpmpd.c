@@ -45,8 +45,8 @@
 
 struct mapping {
 	u_int32_t		 proto;
-	struct sockaddr		 dst;
-	struct sockaddr		 rdr;
+	struct sockaddr_storage	 dst;
+	struct sockaddr_storage	 rdr;
 	struct event		 ev;
 	u_int8_t		*nonce;
 	LIST_ENTRY(mapping)	 entry;
@@ -291,7 +291,8 @@ rebuild_rules(void)
 	if (prepare_commit() == -1)
 		goto fail;
 	for (m = LIST_FIRST(&mappings); m != NULL; m = LIST_NEXT(m, entry))
-		if (add_rdr(m->proto, &m->dst, &m->rdr) == -1)
+		if (add_rdr(m->proto, (struct sockaddr *)&m->dst,
+		    (struct sockaddr *)&m->rdr) == -1)
 			goto fail;
 	if (do_commit() == -1) {
 		if (errno != EBUSY)
@@ -482,10 +483,10 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 	 */
 	for (m = LIST_FIRST(&mappings), r = NULL; m; m = LIST_NEXT(m, entry)) {
 		if ((m->proto != proto) &&
-		    (memcmp(&m->rdr, rdr, sizeof(m->rdr)) == 0))
+		    (memcmp(&m->rdr, rdr, sizeof(rdr)) == 0))
 			r = m;
 		if ((m->proto == proto) &&
-		    (memcmp(&m->rdr, rdr, sizeof(m->rdr)) == 0))
+		    (memcmp(&m->rdr, rdr, sizeof(rdr)) == 0))
 			break;
 	}
 
@@ -494,7 +495,7 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 		 * Update the requested external port from the live mapping 
 		 * if it differs.
 		 */
-		if (memcmp(&m->dst, dst, sizeof(m->dst)) != 0) {
+		if (memcmp(&m->dst, dst, sizeof(dst)) != 0) {
 			fprintf(stderr, "Existing mapping with different port\n");
 			sa = (struct sockaddr_in *)&m->dst;
 			dst->sin_port = sa->sin_port;
@@ -523,8 +524,8 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 		    arc4random_uniform(IPPORT_HILASTAUTO - IPPORT_HIFIRSTAUTO));
 
 	m->proto = proto;
-	memcpy(&m->dst, dst, sizeof(m->dst));
-	memcpy(&m->rdr, rdr, sizeof(m->rdr));
+	memcpy(&m->dst, dst, sizeof(dst));
+	memcpy(&m->rdr, rdr, sizeof(rdr));
 
 	evtimer_set(&m->ev, expire_mapping, m);
 	evtimer_add(&m->ev, &tv);
