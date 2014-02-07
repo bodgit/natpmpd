@@ -48,6 +48,7 @@ struct mapping {
 	struct sockaddr		 dst;
 	struct sockaddr		 rdr;
 	struct event		 ev;
+	u_int8_t		*nonce;
 	LIST_ENTRY(mapping)	 entry;
 };
 
@@ -174,6 +175,9 @@ ssize_t		 natpmp_mapping(struct natpmp_response *, u_int8_t,
 		     struct natpmpd *);
 void		 natpmp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
 		     struct sockaddr *);
+u_int8_t	 pcp_map(u_int8_t, struct in6_addr, u_int16_t,
+		     struct in6_addr *, u_int16_t *, u_int32_t *, u_int8_t *,
+		     unsigned int, struct pcp_filters *);
 void		 pcp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
 		     struct sockaddr *);
 void		 check_interface(struct natpmpd *);
@@ -223,6 +227,8 @@ handle_signal(int sig, short event, void *arg)
 		if (evtimer_pending(&m->ev, NULL))
 			evtimer_del(&m->ev);
 		LIST_REMOVE(m, entry);
+		if (m->nonce)
+			free(m->nonce);
 		free(m);
 	}
 
@@ -269,6 +275,8 @@ expire_mapping(int fd, short event, void *arg)
 	 */
 
 	LIST_REMOVE(m, entry);
+	if (m->nonce)
+		free(m->nonce);
 	free(m);
 
 	if (rebuild_rules() == -1)
@@ -691,6 +699,59 @@ natpmp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	    SA_LEN((struct sockaddr *)sock));
 }
 
+u_int8_t
+pcp_map(u_int8_t protocol, struct in6_addr dst_addr, u_int16_t dst_port,
+    struct in6_addr *src_addr, u_int16_t *src_port, u_int32_t *lifetime,
+    u_int8_t *nonce, unsigned int flags, struct pcp_filters *filters)
+{
+	/* FIXME We don't support IPv6 for now */
+	if (!IN6_IS_ADDR_V4MAPPED(src_addr))
+		return (PCP_UNSUPP_FAMILY);
+
+	if (protocol > 0)
+		if (dst_port > 0)
+			/* Specific port */
+			switch (protocol) {
+			case IPPROTO_TCP:
+				/* FALLTHROUGH */
+			case IPPROTO_UDP:
+				break;
+			default:
+				return (PCP_UNSUPP_PROTOCOL);
+				/* NOTREACHED */
+			}
+		else
+			/* FIXME All ports */
+			return (PCP_UNSUPP_PROTOCOL);
+	else
+		if (dst_port == 0)
+			/* FIXME All protocols */
+			return (PCP_UNSUPP_PROTOCOL);
+		else
+			return (PCP_MALFORMED_REQUEST);
+
+	/* PREFER_FAILURE option and all ports is illegal */
+	if (dst_port == 0 && flags & (1 << PCP_OPTION_PREFER_FAILURE))
+		return (PCP_MALFORMED_OPTION);
+
+	if (lifetime > 0)
+		/* Create or renew existing mapping */
+		return (PCP_SUCCESS);
+	else {
+		/* Delete mapping, but included PREFER_FAILURE and/or FILTER
+		 * options
+		 */
+		if (flags & (1 << PCP_OPTION_PREFER_FAILURE) ||
+		    !TAILQ_EMPTY(filters))
+			return (PCP_MALFORMED_OPTION);
+
+		/* Delete mapping */
+		return (PCP_SUCCESS);
+	}
+
+	return (PCP_SUCCESS);
+}
+
 void
 pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
     ssize_t len, struct sockaddr *sock)
@@ -765,22 +826,24 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	    request->version, request->opcode, len, ntohl(request->lifetime),
 	    log_sockaddr(sock));
 
-	/* Calculate opcode size and set up pointers */
+	/* Calculate opcode size and set up pointers into the response
+	 * packet which by now has a copy of the request packet
+	 */
 	switch (request->opcode) {
 	case PCP_OPCODE_ANNOUNCE:
 		opcode = sizeof(struct pcp_header);
 		break;
 	case PCP_OPCODE_MAP:
 		opcode = sizeof(struct pcp_header) + sizeof(struct pcp_map);
-		map = (struct pcp_map *)(request_storage + sizeof(struct pcp_header));
+		map = (struct pcp_map *)(response_storage + sizeof(struct pcp_header));
 		break;
 #if 0
 	case PCP_OPCODE_PEER:
 		opcode = sizeof(struct pcp_header) + sizeof(struct pcp_map)
 		    + sizeof(struct pcp_peer);
-		map = (struct pcp_map *)(request_storage
+		map = (struct pcp_map *)(response_storage
 		    + sizeof(struct pcp_header));
-		peer = (struct pcp_peer *)(request_storage
+		peer = (struct pcp_peer *)(response_storage
 		    + sizeof(struct pcp_header) + sizeof(struct pcp_map));
 		break;
 #endif
@@ -951,32 +1014,58 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 		src_port = ntohs(map->port[1]);
 		lifetime = ntohl(request->lifetime);
 
-#if 0
 		if ((response->result = pcp_map(map->protocol, dst_addr,
 		    ntohs(map->port[0]), &src_addr, &src_port, &lifetime,
 		    nonce, flags, &filters)) != PCP_SUCCESS)
 			goto send;
-#endif
 
-		/* Success, build up response packet */
+		/* Success, modify response packet */
+		memcpy(&map->addr, &src_addr, sizeof(struct in6_addr));
+		memcpy(&map->nonce, &nonce, sizeof(nonce));
+		map->port[1] = htons(src_port);
+		response->lifetime = htonl(lifetime);
 
 		break;
 	case PCP_OPCODE_PEER:
-		break;
+		/* FALLTHROUGH */
 	default:
-		break;
+		fatalx("unimplemented opcode");
+		/* NOTREACHED */
 	}
-
-	/* FIXME */
-	return;
 
 	if (response->result != PCP_SUCCESS)
 		fatalx("error without goto");
+
+	/* Response length without any options */
+	len = opcode;
 
 	/* Append all of the options in the list to the response as we will
 	 * have acted upon them
 	 */
 	while ((option = TAILQ_FIRST(&options))) {
+		/* Before copying anything, set any reserved fields to 0 */
+		option->header->reserved = 0;
+		switch (option->header->code) {
+		case PCP_OPTION_FILTER:
+			(&option->data)->filter->reserved = 0;
+			break;
+		default:
+			break;
+		}
+
+		/* Append option header to response */
+		oh = (struct pcp_option_header *)(response_storage + len);
+		memcpy(oh, option->header, sizeof(struct pcp_option_header));
+
+		/* Calculate option data length, (rounding up to the nearest
+		 * whole 4 octets), and append after option header
+		 */
+		optlen = (ntohs(oh->length) + 3) & ~0x03;
+		memcpy(oh + sizeof(struct pcp_option_header),
+		    (&option->data)->raw, optlen);
+
+		/* Increase response length */
+		len += sizeof(struct pcp_option_header) + optlen;
 		
 		TAILQ_REMOVE(&options, option, entry);
 		free(option);
