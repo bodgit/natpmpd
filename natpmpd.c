@@ -706,7 +706,8 @@ pcp_map(u_int8_t protocol, struct in6_addr dst_addr, u_int16_t dst_port,
     u_int8_t *nonce, unsigned int flags, struct pcp_filters *filters)
 {
 	/* FIXME We don't support IPv6 for now */
-	if (!IN6_IS_ADDR_V4MAPPED(src_addr))
+	if (!IN6_IS_ADDR_V4MAPPED(src_addr)
+	    || !IN6_IS_ADDR_V4MAPPED(&dst_addr))
 		return (PCP_UNSUPP_FAMILY);
 
 	if (protocol > 0)
@@ -783,7 +784,6 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	response->opcode |= 0x80;
 	response->reserved = 0;
 	response->lifetime = PCP_LONG_LIFETIME;
-	(&response->data)->sssoe = htonl(sssoe(env));
 
 	/* Version negotiation */
 	if (request->version < PCP_MIN_VERSION ||
@@ -1021,6 +1021,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			goto send;
 
 		/* Success, modify response packet */
+		memset(&map->reserved, 0, 3);
 		memcpy(&map->addr, &src_addr, sizeof(struct in6_addr));
 		memcpy(&map->nonce, &nonce, sizeof(nonce));
 		map->port[1] = htons(src_port);
@@ -1036,6 +1037,9 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 
 	if (response->result != PCP_SUCCESS)
 		fatalx("error without goto");
+
+	/* Zero out the client IP address */
+	memset(&(&response->data)->addr, 0, sizeof(struct in6_addr));
 
 	/* Response length without any options */
 	len = opcode;
@@ -1073,6 +1077,9 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	}
 
 send:
+	/* Set epoch time */
+	(&response->data)->sssoe = htonl(sssoe(env));
+
 	/* Clean up any options */
 	while ((option = TAILQ_FIRST(&options))) {
 		TAILQ_REMOVE(&options, option, entry);
