@@ -98,7 +98,7 @@ struct pcp_header {
 
 /* MAP opcode has this struct following the header */
 struct pcp_map {
-	u_int8_t		 nonce[12];
+	u_int8_t		 nonce[PCP_NONCE_LENGTH];
 	u_int8_t		 protocol;
 	u_int8_t		 reserved[3];
 	u_int16_t		 port[2];
@@ -175,14 +175,18 @@ ssize_t		 natpmp_mapping(struct natpmp_response *, u_int8_t,
 		     struct natpmpd *);
 void		 natpmp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
 		     struct sockaddr *);
-u_int8_t	 pcp_map(u_int8_t, struct in6_addr, u_int16_t,
-		     struct in6_addr *, u_int16_t *, u_int32_t *, u_int8_t *,
-		     unsigned int, struct pcp_filters *);
+u_int8_t	 pcp_map(struct natpmpd *, u_int8_t, struct in6_addr,
+		     u_int16_t, struct in6_addr *, u_int16_t *, u_int32_t *,
+		     u_int8_t *, unsigned int, struct pcp_filters *);
 void		 pcp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
 		     struct sockaddr *);
 void		 check_interface(struct natpmpd *);
 int		 rebuild_rules(void);
 u_int32_t	 sssoe(struct natpmpd *);
+void		 to_sockaddr(struct sockaddr_storage *, struct in6_addr,
+		     u_int16_t);
+void		 from_sockaddr(struct sockaddr_storage, struct in6_addr *,
+		     u_int16_t *);
 
 struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{  0,      0 },
@@ -256,6 +260,8 @@ init_mapping(void)
 	if ((m = calloc(1, sizeof(struct mapping))) == NULL)
 		return (NULL);
 
+	evtimer_set(&m->ev, expire_mapping, m);
+
 	LIST_INSERT_HEAD(&mappings, m, entry);
 
 	return (m);
@@ -316,6 +322,48 @@ sssoe(struct natpmpd *env)
 	gettimeofday(&tv, NULL);
 
 	return (tv.tv_sec - env->sc_starttime.tv_sec);
+}
+
+void
+to_sockaddr(struct sockaddr_storage *ss, struct in6_addr addr, u_int16_t port)
+{
+	memset(ss, 0, sizeof(struct sockaddr_storage));
+
+	if (IN6_IS_ADDR_V4MAPPED(&addr)) {
+		((struct sockaddr_in *)ss)->sin_family = AF_INET;
+		((struct sockaddr_in *)ss)->sin_len =
+		    sizeof(struct sockaddr_in);
+		((struct sockaddr_in *)ss)->sin_addr.s_addr =
+		    *(const u_int32_t *)(&(&addr)->s6_addr[12]);
+		((struct sockaddr_in *)ss)->sin_port = htons(port);
+	} else {
+		((struct sockaddr_in6 *)ss)->sin6_family = AF_INET6;
+		((struct sockaddr_in6 *)ss)->sin6_len =
+		    sizeof(struct sockaddr_in6);
+		memcpy(&((struct sockaddr_in6 *)ss)->sin6_addr, &addr,
+		    sizeof(struct in6_addr));
+		((struct sockaddr_in6 *)ss)->sin6_port = htons(port);
+	}
+}
+
+void
+from_sockaddr(struct sockaddr_storage ss, struct in6_addr *addr,
+    u_int16_t *port)
+{
+	struct in6_addr	 new_addr = IN6ADDR_V4MAPPED_INIT;
+
+	if ((&ss)->ss_family == AF_INET) {
+		memcpy(&new_addr.s6_addr[12],
+		    &((struct sockaddr_in *)&ss)->sin_addr,
+		    sizeof(struct in_addr));
+		*port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+	} else {
+		memcpy(&new_addr,
+		    &((struct sockaddr_in6 *)&ss)->sin6_addr,
+		    sizeof(struct in6_addr));
+		*port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+	}
+	memcpy(addr, &new_addr, sizeof(struct in6_addr));
 }
 
 void
@@ -527,7 +575,6 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 	memcpy(&m->dst, dst, sizeof(dst));
 	memcpy(&m->rdr, rdr, sizeof(rdr));
 
-	evtimer_set(&m->ev, expire_mapping, m);
 	evtimer_add(&m->ev, &tv);
 
 	return (1);
@@ -701,10 +748,17 @@ natpmp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 }
 
 u_int8_t
-pcp_map(u_int8_t protocol, struct in6_addr dst_addr, u_int16_t dst_port,
-    struct in6_addr *src_addr, u_int16_t *src_port, u_int32_t *lifetime,
-    u_int8_t *nonce, unsigned int flags, struct pcp_filters *filters)
+pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
+    u_int16_t dst_port, struct in6_addr *src_addr, u_int16_t *src_port,
+    u_int32_t *lifetime, u_int8_t *nonce, unsigned int flags,
+    struct pcp_filters *filters)
 {
+	struct sockaddr_storage	 rdr, dst;
+	struct mapping		*m, *r;
+	struct timeval		 tv = { *lifetime, 0 }, t0, t1;
+	struct in6_addr		 new_addr = IN6ADDR_V4MAPPED_INIT;
+	u_int16_t		 new_port;
+
 	/* FIXME We don't support IPv6 for now */
 	if (!IN6_IS_ADDR_V4MAPPED(src_addr)
 	    || !IN6_IS_ADDR_V4MAPPED(&dst_addr))
@@ -736,19 +790,165 @@ pcp_map(u_int8_t protocol, struct in6_addr dst_addr, u_int16_t dst_port,
 	if (dst_port == 0 && flags & (1 << PCP_OPTION_PREFER_FAILURE))
 		return (PCP_MALFORMED_OPTION);
 
-	if (lifetime > 0)
-		/* Create or renew existing mapping */
-		return (PCP_SUCCESS);
-	else {
+	to_sockaddr(&dst, *src_addr, *src_port);
+	to_sockaddr(&rdr, dst_addr, dst_port);
+
+	/* We don't have an external address */
+	if ((&dst)->ss_family == AF_INET) {
+		if (IN6_IS_ADDR_V4MAPPED_ANY(&env->sc_address))
+			return (PCP_NETWORK_FAILURE);
+	} else {
+		/* FIXME Check IPv6 address here */
+	}
+
+	for (m = LIST_FIRST(&mappings), r = NULL; m; m = LIST_NEXT(m, entry)) {
+		if (m->proto != protocol &&
+		    memcmp(&m->rdr, &rdr, sizeof(rdr)) == 0 &&
+		    (&m->dst)->ss_family == (&dst)->ss_family)
+			r = m;
+		if (m->proto == protocol &&
+		    memcmp(&m->rdr, &rdr, sizeof(rdr)) == 0 &&
+		    (&m->dst)->ss_family == (&dst)->ss_family)
+			break;
+	}
+
+	/* Create or renew existing mapping */
+	if (*lifetime > 0) {
+		/* Mapping found */
+		if (m) {
+			/* PREFER_FAILURE and it doesn't match */
+			if (flags & (1 << PCP_OPTION_PREFER_FAILURE)
+			    && memcmp(&m->dst, &dst, sizeof(dst)))
+				return (PCP_CANNOT_PROVIDE_EXTERNAL);
+
+			if (m->nonce == NULL
+			    || memcmp(m->nonce, nonce, PCP_NONCE_LENGTH)) {
+				/* Mapping created by NAT-PMP or different
+				 * nonce
+				 */
+				if (evtimer_pending(&m->ev, &t0)) {
+					gettimeofday(&t1, NULL);
+					timersub(&t0, &t1, &tv);
+					*lifetime = tv.tv_sec;
+				} else
+					/* Shouldn't ever happen? */
+					*lifetime = 0; // UINT_MAX
+			} else {
+				/* Nonce matches, refresh the expiry timer */
+				if (evtimer_pending(&m->ev, NULL))
+					evtimer_del(&m->ev);
+				evtimer_add(&m->ev, &tv);
+			}
+		} else {
+			/* FIXME PREFER_FAILURE and requested address doesn't
+			 * match, or the port won't likely match either due to
+			 * being randomly generated
+			 */
+			if (flags & (1 << PCP_OPTION_PREFER_FAILURE))
+				return (PCP_CANNOT_PROVIDE_EXTERNAL);
+
+			if((m = init_mapping()) == NULL)
+				return (PCP_NO_RESOURCES);
+
+			/* If we found a "related" mapping use the port from
+			 * that as per the draft, otherwise conjure up a
+			 * random one
+			 */
+			if (r != NULL) {
+				if ((&r->dst)->ss_family == AF_INET)
+					new_port = ((struct sockaddr_in *)&r->dst)->sin_port;
+				else
+					new_port = ((struct sockaddr_in6 *)&r->dst)->sin6_port;
+			} else
+				/* Check for collisions? */
+				new_port = htons(IPPORT_HIFIRSTAUTO +
+				    arc4random_uniform(IPPORT_HILASTAUTO -
+				    IPPORT_HIFIRSTAUTO));
+
+			if ((&dst)->ss_family == AF_INET) {
+				((struct sockaddr_in *)&dst)->sin_addr.s_addr =
+				    *(const u_int32_t *)(&(&env->sc_address)->s6_addr[12]);
+				((struct sockaddr_in *)&dst)->sin_port = new_port;
+			} else {
+				/* FIXME Add IPv6 address here */
+				((struct sockaddr_in6 *)&dst)->sin6_port = new_port;
+			}
+
+			/* Store nonce */
+			if ((m->nonce = calloc(sizeof(u_int8_t),
+			    PCP_NONCE_LENGTH)) == NULL) {
+				LIST_REMOVE(m, entry);
+				free(m);
+				return (PCP_NO_RESOURCES);
+			}
+			memcpy(m->nonce, nonce, PCP_NONCE_LENGTH);
+
+			m->proto = protocol;
+			memcpy(&m->dst, &dst, sizeof(dst));
+			memcpy(&m->rdr, &rdr, sizeof(rdr));
+
+			evtimer_add(&m->ev, &tv);
+
+			/* Or PCP_NO_RESOURCES? */
+			if (rebuild_rules() == -1)
+				return (PCP_NOT_AUTHORISED);
+		}
+
+		from_sockaddr(m->dst, src_addr, src_port);
+	} else {
 		/* Delete mapping, but included PREFER_FAILURE and/or FILTER
 		 * options
 		 */
-		if (flags & (1 << PCP_OPTION_PREFER_FAILURE) ||
-		    !TAILQ_EMPTY(filters))
+		if (flags & (1 << PCP_OPTION_PREFER_FAILURE)
+		    || !TAILQ_EMPTY(filters))
 			return (PCP_MALFORMED_OPTION);
 
 		/* Delete mapping */
-		return (PCP_SUCCESS);
+		if (m) {
+			if (m->nonce == NULL
+			    || memcmp(m->nonce, nonce, PCP_NONCE_LENGTH)) {
+				/* FIXME What to do if nonce doesn't match? */
+				/* Mapping created by NAT-PMP or different
+				 * nonce
+				 */
+				if (evtimer_pending(&m->ev, &t0)) {
+					gettimeofday(&t1, NULL);
+					timersub(&t0, &t1, &tv);
+					*lifetime = tv.tv_sec;
+				} else
+					/* Shouldn't ever happen? */
+					*lifetime = 0; // UINT_MAX
+
+				from_sockaddr(m->dst, src_addr, src_port);
+			} else {
+				/* Remove the mapping */
+				LIST_REMOVE(m, entry);
+
+				/* Can't rebuild rules, put it back again */
+				if (rebuild_rules() == -1) {
+					LIST_INSERT_HEAD(&mappings, m, entry);
+					return (PCP_NOT_AUTHORISED);
+				}
+
+				/* Remove the expiry timer */
+				if (evtimer_pending(&m->ev, NULL))
+					evtimer_del(&m->ev);
+
+				/* Set external address to family-specific
+				 * all-zeroes address and port to zero
+				 */
+				if ((&m->dst)->ss_family == AF_INET) {
+					memcpy(src_addr, &new_addr,
+					    sizeof(struct in6_addr));
+				} else
+					memset(src_addr, 0,
+					    sizeof(struct in6_addr));
+				*src_port = 0;
+
+				free(m->nonce);
+				free(m);
+			}
+		}
 	}
 
 	return (PCP_SUCCESS);
@@ -776,14 +976,12 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	unsigned int			 counts[nitems(pcp_options)], i, flags = 0;
 	u_int16_t			 src_port;
 	u_int32_t			 lifetime;
-	u_int8_t			 nonce[12];
 
 	memset(response_storage, 0, sizeof(response_storage));
 	memcpy(response_storage, request_storage,
 	    (len < PCP_MAX_PACKET_SIZE) ? len : PCP_MAX_PACKET_SIZE);
 	response->opcode |= 0x80;
 	response->reserved = 0;
-	response->lifetime = PCP_LONG_LIFETIME;
 
 	/* Version negotiation */
 	if (request->version < PCP_MIN_VERSION ||
@@ -927,7 +1125,6 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			if ((option = calloc(1, sizeof(struct pcp_option))) == NULL) {
 				log_debug("no resources");
 				response->result = PCP_NO_RESOURCES;
-				response->lifetime = PCP_SHORT_LIFETIME;
 				goto send;
 			}
 
@@ -988,7 +1185,6 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			if ((filter = calloc(1, sizeof(struct pcp_filter))) == NULL) {
 				log_debug("no resources");
 				response->result = PCP_NO_RESOURCES;
-				response->lifetime = PCP_SHORT_LIFETIME;
 				goto send;
 			}
 
@@ -1007,26 +1203,25 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	
 	switch (request->opcode) {
 	case PCP_OPCODE_ANNOUNCE:
+		response->result = PCP_SUCCESS;
+		response->lifetime = 0;
 		break;
 	case PCP_OPCODE_MAP:
 		/* Make copies of the things that may get changed */
 		memcpy(&src_addr, &map->addr, sizeof(struct in6_addr));
-		memcpy(&nonce, &map->nonce, sizeof(nonce));
 		src_port = ntohs(map->port[1]);
 		lifetime = ntohl(request->lifetime);
 
-		if ((response->result = pcp_map(map->protocol, dst_addr,
+		if ((response->result = pcp_map(env, map->protocol, dst_addr,
 		    ntohs(map->port[0]), &src_addr, &src_port, &lifetime,
-		    nonce, flags, &filters)) != PCP_SUCCESS)
+		    map->nonce, flags, &filters)) != PCP_SUCCESS)
 			goto send;
 
 		/* Success, modify response packet */
 		memset(&map->reserved, 0, 3);
 		memcpy(&map->addr, &src_addr, sizeof(struct in6_addr));
-		memcpy(&map->nonce, &nonce, sizeof(nonce));
 		map->port[1] = htons(src_port);
 		response->lifetime = htonl(lifetime);
-
 		break;
 	case PCP_OPCODE_PEER:
 		/* FALLTHROUGH */
@@ -1077,6 +1272,21 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	}
 
 send:
+	switch (response->result) {
+	case PCP_SUCCESS:
+		break;
+	case PCP_NETWORK_FAILURE:
+		/* FALLTHROUGH */
+	case PCP_NO_RESOURCES:
+		/* FALLTHROUGH */
+	case PCP_USER_EX_QUOTA:
+		response->lifetime = htonl(PCP_SHORT_LIFETIME);
+		break;
+	default:
+		response->lifetime = htonl(PCP_LONG_LIFETIME);
+		break;
+	}
+
 	/* Set epoch time */
 	(&response->data)->sssoe = htonl(sssoe(env));
 

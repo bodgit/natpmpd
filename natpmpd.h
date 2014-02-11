@@ -85,8 +85,10 @@
 #define	PCP_EXCESSIVE_REMOTE_PEERS	 13
 #define	PCP_UNSUPP_FAMILY		 14
 
-#define	PCP_SHORT_LIFETIME		 (htonl(30))
-#define	PCP_LONG_LIFETIME		 (htonl(1800))
+#define	PCP_SHORT_LIFETIME		 30
+#define	PCP_LONG_LIFETIME		 1800
+
+#define	PCP_NONCE_LENGTH		 12
 
 #define	PCP_MAX_PACKET_SIZE		 1100
 
