@@ -92,6 +92,8 @@
 
 #define	PCP_MAX_PACKET_SIZE		 1100
 
+#define	PCP_MAX_REMOTE_PEERS		 10
+
 #define	PCP_OPCODE_ANNOUNCE		 0
 #define	PCP_OPCODE_MAP			 1
 #define	PCP_OPCODE_PEER			 2

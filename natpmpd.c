@@ -62,6 +62,8 @@ struct mapping {
 	struct pcp_filters	 filters;
 };
 
+LIST_HEAD(mappings, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
+
 struct common_header {
 	u_int8_t		 version;
 	u_int8_t		 opcode;
@@ -163,7 +165,7 @@ struct pcp_option_rule {
 
 void		 handle_signal(int, short, void *);
 __dead void	 usage(void);
-struct mapping	*init_mapping(void);
+struct mapping	*init_mapping(struct mappings *, struct mapping *);
 void		 free_mapping(struct mapping *);
 void		 expire_mapping(int, short, void *);
 void		 announce_address(int, short, void *);
@@ -177,6 +179,8 @@ ssize_t		 natpmp_mapping(struct natpmp_response *, u_int8_t,
 		     struct natpmpd *);
 void		 natpmp_handler(struct natpmpd *, int, u_int8_t *, ssize_t,
 		     struct sockaddr *);
+u_int8_t	 pcp_append_filters(struct pcp_filters *,
+		     struct pcp_filters *);
 u_int8_t	 pcp_map(struct natpmpd *, u_int8_t, struct in6_addr,
 		     u_int16_t, struct in6_addr *, u_int16_t *, u_int32_t *,
 		     u_int8_t *, unsigned int, struct pcp_filters *);
@@ -202,8 +206,6 @@ struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{ 32,      0 },
 	{ 64,      0 },
 };
-
-LIST_HEAD(, mapping) mappings = LIST_HEAD_INITIALIZER(mappings);
 
 /* XXX This (empty) list should move elsewhere eventually */
 TAILQ_HEAD(, pcp_third_party) third_party = TAILQ_HEAD_INITIALIZER(third_party);
@@ -251,9 +253,10 @@ usage(void)
 }
 
 struct mapping *
-init_mapping(void)
+init_mapping(struct mappings *head, struct mapping *clone)
 {
-	struct mapping	*m;
+	struct mapping		*m;
+	struct pcp_filter	*of, *nf;
 
 	if ((m = calloc(1, sizeof(struct mapping))) == NULL)
 		return (NULL);
@@ -261,7 +264,28 @@ init_mapping(void)
 	evtimer_set(&m->ev, expire_mapping, m);
 	TAILQ_INIT(&m->filters);
 
-	LIST_INSERT_HEAD(&mappings, m, entry);
+	if (clone) {
+		if (clone->nonce) {
+			if ((m->nonce = calloc(sizeof(u_int8_t),
+			    PCP_NONCE_LENGTH)) == NULL) {
+				free_mapping(m);
+				return (NULL);
+			}
+			memcpy(m->nonce, clone->nonce, PCP_NONCE_LENGTH);
+		}
+		for (of = TAILQ_FIRST(&clone->filters); of;
+		    of = TAILQ_NEXT(of, entry)) {
+			if ((nf = calloc(1, sizeof(struct pcp_filter))) == NULL) {
+				free_mapping(m);
+				return (NULL);
+			}
+			memcpy(nf, of, sizeof(struct pcp_filter));
+			TAILQ_INSERT_TAIL(&m->filters, nf, entry);
+		}
+	}
+
+	if (head)
+		LIST_INSERT_HEAD(head, m, entry);
 
 	return (m);
 }
@@ -566,7 +590,7 @@ natpmp_create_mapping(u_int8_t proto, struct sockaddr_in *rdr,
 		return (0);
 	}
 
-	if((m = init_mapping()) == NULL)
+	if((m = init_mapping(&mappings, NULL)) == NULL)
 		fatal("init_mapping");
 
 	/* If we found a "related" mapping use the port from that as per the
@@ -757,6 +781,47 @@ natpmp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 }
 
 u_int8_t
+pcp_append_filters(struct pcp_filters *dst, struct pcp_filters *src)
+{
+	struct pcp_filter	*of;
+	struct pcp_filter	*nf;
+	int			 count;
+
+	/* Count how many are in the filter list currently */
+	for (of = TAILQ_FIRST(dst), count = 0; of;
+	    of = TAILQ_NEXT(of, entry), count++);
+
+	for (of = TAILQ_FIRST(src); of; of = TAILQ_NEXT(of, entry)) {
+		/* Prefix length of zero means clear list */
+		if (of->prefix == 0) {
+			while ((nf = TAILQ_FIRST(dst))) {
+				TAILQ_REMOVE(dst, nf, entry);
+				free(nf);
+			}
+			count = 0;
+			continue;
+		}
+
+		/* Would exceed the filter limit */
+		if (++count > PCP_MAX_REMOTE_PEERS)
+			return (PCP_EXCESSIVE_REMOTE_PEERS);
+#if 0
+		/* Copy the list element */
+		if ((nf = calloc(1, sizeof(struct pcp_filter))) == NULL)
+			return (PCP_NO_RESOURCES);
+		memcpy(nf, of, sizeof(struct pcp_filter));
+		TAILQ_INSERT_TAIL(dst, nf, entry);
+#else
+		/* Remove from one list, append to the other */
+		TAILQ_REMOVE(src, of, entry);
+		TAILQ_INSERT_TAIL(dst, of, entry);
+#endif
+	}
+
+	return (PCP_SUCCESS);
+}
+
+u_int8_t
 pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
     u_int16_t dst_port, struct in6_addr *src_addr, u_int16_t *src_port,
     u_int32_t *lifetime, u_int8_t *nonce, unsigned int flags,
@@ -767,6 +832,7 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 	struct timeval		 tv = { *lifetime, 0 }, t0, t1;
 	struct in6_addr		 new_addr = IN6ADDR_V4MAPPED_INIT;
 	u_int16_t		 new_port;
+	u_int8_t		 result;
 
 	/* FIXME We don't support IPv6 for now */
 	if (!IN6_IS_ADDR_V4MAPPED(src_addr)
@@ -843,7 +909,38 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 					/* Shouldn't ever happen? */
 					*lifetime = 0; // UINT_MAX
 			} else {
-				/* Nonce matches, refresh the expiry timer */
+				/* Nonce matches */
+
+				/* Append any filters */
+				if (!TAILQ_EMPTY(filters)) {
+					/* Clone existing mapping */
+					if ((r = init_mapping(NULL, m)) == NULL)
+						return (PCP_NO_RESOURCES);
+
+					/* Update filters */
+					if ((result = pcp_append_filters(&r->filters,
+					    filters)) != PCP_SUCCESS) {
+						free_mapping(r);
+						return (result);
+					}
+
+					/* Swap original mapping with clone */
+					LIST_REPLACE(m, r, entry);
+
+					if (rebuild_rules() == -1) {
+						/* Rebuild failed, swap back
+						 * and free the clone mapping
+						 */
+						LIST_REPLACE(r, m, entry);
+						free_mapping(r);
+						return (PCP_NOT_AUTHORISED);
+					}
+
+					free_mapping(m);
+					m = r;
+				}
+
+				/* Refresh the expiry timer */
 				if (evtimer_pending(&m->ev, NULL))
 					evtimer_del(&m->ev);
 				evtimer_add(&m->ev, &tv);
@@ -856,7 +953,7 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 			if (flags & (1 << PCP_OPTION_PREFER_FAILURE))
 				return (PCP_CANNOT_PROVIDE_EXTERNAL);
 
-			if((m = init_mapping()) == NULL)
+			if((m = init_mapping(&mappings, NULL)) == NULL)
 				return (PCP_NO_RESOURCES);
 
 			/* If we found a "related" mapping use the port from
@@ -898,9 +995,20 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 
 			evtimer_add(&m->ev, &tv);
 
+			/* Add filters */
+			if ((result = pcp_append_filters(&m->filters,
+			    filters)) != PCP_SUCCESS) {
+				LIST_REMOVE(m, entry);
+				free_mapping(m);
+				return (result);
+			}
+
 			/* Or PCP_NO_RESOURCES? */
-			if (rebuild_rules() == -1)
+			if (rebuild_rules() == -1) {
+				LIST_REMOVE(m, entry);
+				free_mapping(m);
 				return (PCP_NOT_AUTHORISED);
+			}
 		}
 
 		from_sockaddr(m->dst, src_addr, src_port);
@@ -1186,6 +1294,10 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 				goto send;
 			}
 
+			/* FIXME Check filter is the right address family
+			 * here?
+			 */
+
 			if ((filter = calloc(1, sizeof(struct pcp_filter))) == NULL) {
 				log_debug("no resources");
 				response->result = PCP_NO_RESOURCES;
@@ -1300,7 +1412,7 @@ send:
 		free(option);
 	}
 
-	/* Clean up any filters */
+	/* Clean up any filters that remain unconsumed */
 	while ((filter = TAILQ_FIRST(&filters))) {
 		TAILQ_REMOVE(&filters, filter, entry);
 		free(filter);
