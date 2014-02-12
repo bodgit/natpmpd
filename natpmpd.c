@@ -43,6 +43,15 @@
 
 #include "natpmpd.h"
 
+struct pcp_filter {
+	TAILQ_ENTRY(pcp_filter)	 entry;
+	struct in6_addr		 addr;
+	u_int16_t		 port;
+	u_int8_t		 prefix;
+};
+
+TAILQ_HEAD(pcp_filters, pcp_filter);
+
 struct mapping {
 	u_int32_t		 proto;
 	struct sockaddr_storage	 dst;
@@ -50,6 +59,7 @@ struct mapping {
 	struct event		 ev;
 	u_int8_t		*nonce;
 	LIST_ENTRY(mapping)	 entry;
+	struct pcp_filters	 filters;
 };
 
 struct common_header {
@@ -133,15 +143,6 @@ struct pcp_third_party {
 	TAILQ_ENTRY(pcp_third_party)	 entry;
 };
 
-struct pcp_filter {
-	u_int8_t		 prefix;
-	u_int16_t		 port;
-	struct in6_addr		 addr;
-	TAILQ_ENTRY(pcp_filter)	 entry;
-};
-
-TAILQ_HEAD(pcp_filters, pcp_filter);
-
 struct pcp_option {
 	struct pcp_option_header		*header;
 	union {
@@ -163,6 +164,7 @@ struct pcp_option_rule {
 void		 handle_signal(int, short, void *);
 __dead void	 usage(void);
 struct mapping	*init_mapping(void);
+void		 free_mapping(struct mapping *);
 void		 expire_mapping(int, short, void *);
 void		 announce_address(int, short, void *);
 void		 route_handler(int, short, void *);
@@ -228,12 +230,8 @@ handle_signal(int sig, short event, void *arg)
 	 * hopefully result in an empty anchor after we're gone
 	 */
 	for (m = LIST_FIRST(&mappings); m != NULL; m = LIST_NEXT(m, entry)) {
-		if (evtimer_pending(&m->ev, NULL))
-			evtimer_del(&m->ev);
 		LIST_REMOVE(m, entry);
-		if (m->nonce)
-			free(m->nonce);
-		free(m);
+		free_mapping(m);
 	}
 
 	if (rebuild_rules() == -1)
@@ -261,10 +259,27 @@ init_mapping(void)
 		return (NULL);
 
 	evtimer_set(&m->ev, expire_mapping, m);
+	TAILQ_INIT(&m->filters);
 
 	LIST_INSERT_HEAD(&mappings, m, entry);
 
 	return (m);
+}
+
+void
+free_mapping(struct mapping *m)
+{
+	struct pcp_filter	*f;
+
+	if (evtimer_pending(&m->ev, NULL))
+		evtimer_del(&m->ev);
+	if (m->nonce)
+		free(m->nonce);
+	while ((f = TAILQ_FIRST(&m->filters))) {
+		TAILQ_REMOVE(&m->filters, f, entry);
+		free(f);
+	}
+	free(m);
 }
 
 void
@@ -281,9 +296,7 @@ expire_mapping(int fd, short event, void *arg)
 	 */
 
 	LIST_REMOVE(m, entry);
-	if (m->nonce)
-		free(m->nonce);
-	free(m);
+	free_mapping(m);
 
 	if (rebuild_rules() == -1)
 		log_warn("unable to rebuild ruleset");
@@ -493,18 +506,14 @@ natpmp_remove_mapping(u_int8_t proto, struct sockaddr_in *rdr)
 	count = 0;
 	for (m = LIST_FIRST(&mappings); m; m = LIST_NEXT(m, entry)) {
 		sa = (struct sockaddr_in *)&m->rdr;
-		if ((m->proto == proto)
+		if ((m->nonce == NULL) && (m->proto == proto)
 		    && (memcmp(&sa->sin_addr, &rdr->sin_addr, sizeof(struct in_addr)) == 0)
 		    && ((rdr->sin_port == 0)
 			|| (sa->sin_port == rdr->sin_port))) {
 
-			/* Remove the expiry timer */
-			if (evtimer_pending(&m->ev, NULL))
-				evtimer_del(&m->ev);
-
 			/* Remove the mapping */
 			LIST_REMOVE(m, entry);
-			free(m);
+			free_mapping(m);
 
 			count++;
 		}
@@ -878,7 +887,7 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 			if ((m->nonce = calloc(sizeof(u_int8_t),
 			    PCP_NONCE_LENGTH)) == NULL) {
 				LIST_REMOVE(m, entry);
-				free(m);
+				free_mapping(m);
 				return (PCP_NO_RESOURCES);
 			}
 			memcpy(m->nonce, nonce, PCP_NONCE_LENGTH);
@@ -930,9 +939,7 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 					return (PCP_NOT_AUTHORISED);
 				}
 
-				/* Remove the expiry timer */
-				if (evtimer_pending(&m->ev, NULL))
-					evtimer_del(&m->ev);
+				free_mapping(m);
 
 				/* Set external address to family-specific
 				 * all-zeroes address and port to zero
@@ -944,9 +951,6 @@ pcp_map(struct natpmpd *env, u_int8_t protocol, struct in6_addr dst_addr,
 					memset(src_addr, 0,
 					    sizeof(struct in6_addr));
 				*src_port = 0;
-
-				free(m->nonce);
-				free(m);
 			}
 		}
 	}
