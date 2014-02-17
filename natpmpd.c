@@ -1283,7 +1283,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			TAILQ_INSERT_TAIL(&options, option, entry);
 
 			/* Advance to next option */
-			oh += sizeof(struct pcp_option_header) + optlen;
+			oh = (struct pcp_option_header *)((u_int8_t *)oh + sizeof(struct pcp_option_header) + optlen);
 		}
 	}
 
