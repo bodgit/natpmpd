@@ -33,8 +33,9 @@
 
 #include "natpmpd.h"
 
-int add_addr(struct sockaddr *, struct pf_pool *);
-int prepare_rule(u_int8_t, struct sockaddr *);
+int	 add_addr(struct sockaddr *, struct pf_pool *);
+int	 prepare_rule(u_int8_t, struct sockaddr_storage *,
+	     struct sockaddr_storage *, struct sockaddr *);
 
 static struct pfioc_rule pfr;
 static struct pfioc_trans pft;
@@ -55,14 +56,15 @@ add_addr(struct sockaddr *addr, struct pf_pool *pfp)
 }
 
 int
-add_rdr(u_int8_t proto, struct sockaddr *dst, struct sockaddr *rdr)
+add_rdr(u_int8_t proto, struct sockaddr_storage *src,
+    struct sockaddr_storage *mask, struct sockaddr *dst, struct sockaddr *rdr)
 {
 	if (dst->sa_family != rdr->sa_family) {
 		errno = EINVAL;
 		return (-1);
 	}
 
-	if (prepare_rule(proto, dst) == -1)
+	if (prepare_rule(proto, src, mask, dst) == -1)
 		return (-1);
 
 	if (add_addr(rdr, &pfr.rule.rdr) == -1)
@@ -136,7 +138,8 @@ prepare_commit(void)
 
 
 int
-prepare_rule(u_int8_t proto, struct sockaddr *dst)
+prepare_rule(u_int8_t proto, struct sockaddr_storage *src,
+    struct sockaddr_storage *mask, struct sockaddr *dst)
 {
 	if ((dst->sa_family != AF_INET) ||
 	    (proto != IPPROTO_UDP && proto != IPPROTO_TCP)) {

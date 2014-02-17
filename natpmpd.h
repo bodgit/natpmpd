@@ -168,9 +168,10 @@ int		 host_dns(const char *, struct ntp_addr **);
 /* filter.c */
 void		 init_filter(char *, char *, int);
 int		 prepare_commit(void);
-int		 add_rdr(u_int8_t, struct sockaddr *, struct sockaddr *);
+int		 add_rdr(u_int8_t, struct sockaddr_storage *,
+		     struct sockaddr_storage *, struct sockaddr *,
+		     struct sockaddr *);
 int		 do_commit(void);
 int		 do_rollback(void);
-void		 expire_rules(int, short, void *);
 
 #endif

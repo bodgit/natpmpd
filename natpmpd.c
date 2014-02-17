@@ -45,9 +45,8 @@
 
 struct pcp_filter {
 	TAILQ_ENTRY(pcp_filter)	 entry;
-	struct in6_addr		 addr;
-	u_int16_t		 port;
-	u_int8_t		 prefix;
+	struct sockaddr_storage	 src;
+	struct sockaddr_storage	 mask;
 };
 
 TAILQ_HEAD(pcp_filters, pcp_filter);
@@ -193,6 +192,7 @@ void		 to_sockaddr(struct sockaddr_storage *, struct in6_addr,
 		     u_int16_t);
 void		 from_sockaddr(struct sockaddr_storage, struct in6_addr *,
 		     u_int16_t *);
+void		 in6_prefixlen2mask(struct in6_addr *, int);
 
 struct timeval timeouts[NATPMPD_MAX_DELAY] = {
 	{  0,      0 },
@@ -329,14 +329,24 @@ expire_mapping(int fd, short event, void *arg)
 int
 rebuild_rules(void)
 {
-	struct mapping	*m;
+	struct mapping		*m;
+	struct pcp_filter	*f;
 
 	if (prepare_commit() == -1)
 		goto fail;
 	for (m = LIST_FIRST(&mappings); m != NULL; m = LIST_NEXT(m, entry))
-		if (add_rdr(m->proto, (struct sockaddr *)&m->dst,
-		    (struct sockaddr *)&m->rdr) == -1)
-			goto fail;
+		if (TAILQ_EMPTY(&m->filters)) {
+			if (add_rdr(m->proto, NULL, NULL,
+			    (struct sockaddr *)&m->dst,
+			    (struct sockaddr *)&m->rdr) == -1)
+				goto fail;
+		} else
+			for (f = TAILQ_FIRST(&m->filters); f;
+			    f = TAILQ_NEXT(f, entry))
+				if (add_rdr(m->proto, &f->src, &f->mask,
+				    (struct sockaddr *)&m->dst,
+				    (struct sockaddr *)&m->rdr) == -1)
+					goto fail;
 	if (do_commit() == -1) {
 		if (errno != EBUSY)
 			goto fail;
@@ -401,6 +411,27 @@ from_sockaddr(struct sockaddr_storage ss, struct in6_addr *addr,
 		*port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
 	}
 	memcpy(addr, &new_addr, sizeof(struct in6_addr));
+}
+
+/* Lifted from the kernel source */
+void
+in6_prefixlen2mask(struct in6_addr *maskp, int len)
+{
+	u_char	 maskarray[8] = { 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe, 0xff };
+	int	 bytelen, bitlen, i;
+
+	/* sanity check */
+	if (0 > len || len > 128)
+		return;
+
+	bzero(maskp, sizeof(*maskp));
+	bytelen = len / 8;
+	bitlen = len % 8;
+	for (i = 0; i < bytelen; i++)
+		maskp->s6_addr[i] = 0xff;
+	/* len == 128 is ok because bitlen == 0 then */
+	if (bitlen)
+		maskp->s6_addr[bytelen] = maskarray[bitlen - 1];
 }
 
 void
@@ -791,31 +822,33 @@ pcp_append_filters(struct pcp_filters *dst, struct pcp_filters *src)
 	for (of = TAILQ_FIRST(dst), count = 0; of;
 	    of = TAILQ_NEXT(of, entry), count++);
 
-	for (of = TAILQ_FIRST(src); of; of = TAILQ_NEXT(of, entry)) {
-		/* Prefix length of zero means clear list */
-		if (of->prefix == 0) {
+	of = TAILQ_FIRST(src);
+	while (of) {
+		/* An IPv6 filter with a prefix length of zero means clear
+		 * the list
+		 */
+		if ((&of->mask)->ss_family == AF_INET6
+		    && IN6_IS_ADDR_UNSPECIFIED(&((struct sockaddr_in6 *)&of->mask)->sin6_addr)) {
 			while ((nf = TAILQ_FIRST(dst))) {
 				TAILQ_REMOVE(dst, nf, entry);
 				free(nf);
 			}
 			count = 0;
+			nf = TAILQ_NEXT(of, entry);
+			free(of);
+			of = nf;
 			continue;
 		}
 
 		/* Would exceed the filter limit */
 		if (++count > PCP_MAX_REMOTE_PEERS)
 			return (PCP_EXCESSIVE_REMOTE_PEERS);
-#if 0
-		/* Copy the list element */
-		if ((nf = calloc(1, sizeof(struct pcp_filter))) == NULL)
-			return (PCP_NO_RESOURCES);
-		memcpy(nf, of, sizeof(struct pcp_filter));
-		TAILQ_INSERT_TAIL(dst, nf, entry);
-#else
+
 		/* Remove from one list, append to the other */
+		nf = TAILQ_NEXT(of, entry);
 		TAILQ_REMOVE(src, of, entry);
 		TAILQ_INSERT_TAIL(dst, of, entry);
-#endif
+		of = nf;
 	}
 
 	return (PCP_SUCCESS);
@@ -1088,6 +1121,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 	unsigned int			 counts[nitems(pcp_options)], i, flags = 0;
 	u_int16_t			 src_port;
 	u_int32_t			 lifetime;
+	struct in6_addr			 any_addr = IN6ADDR_ANY_INIT;
 
 	memset(response_storage, 0, sizeof(response_storage));
 	memcpy(response_storage, request_storage,
@@ -1285,18 +1319,17 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			flags |= (1 << PCP_OPTION_PREFER_FAILURE);
 			break;
 		case PCP_OPTION_FILTER:
-			/* Invalid prefix length */
-			if ((IN6_IS_ADDR_V4MAPPED(&(&option->data)->filter->addr) &&
-			    (&option->data)->filter->prefix &&
-			    (&option->data)->filter->prefix < 96) ||
-			    (&option->data)->filter->prefix > 128) {
+			/* If the prefix is non-zero, it must be greater than
+			 * 96 for IPv4 addresses and less than or equal to 128
+			 * for any address, otherwise it is invalid
+			 */
+			if ((&option->data)->filter->prefix
+			    && ((IN6_IS_ADDR_V4MAPPED(&(&option->data)->filter->addr)
+				&& (&option->data)->filter->prefix < 97)
+				|| (&option->data)->filter->prefix > 128)) {
 				response->result = PCP_MALFORMED_OPTION;
 				goto send;
 			}
-
-			/* FIXME Check filter is the right address family
-			 * here?
-			 */
 
 			if ((filter = calloc(1, sizeof(struct pcp_filter))) == NULL) {
 				log_debug("no resources");
@@ -1304,10 +1337,30 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 				goto send;
 			}
 
-			filter->prefix = (&option->data)->filter->prefix;
-			filter->port = (&option->data)->filter->port;
-			memcpy(&filter->addr, &(&option->data)->filter->addr,
-			    sizeof(struct in6_addr));
+			/* For a prefix length of zero, create a dummy IPv6
+			 * sockaddr, ignoring whatever was in the filter
+			 * fields
+			 */
+			if ((&option->data)->filter->prefix)
+				to_sockaddr(&filter->src,
+				    (&option->data)->filter->addr,
+				    ntohs((&option->data)->filter->port));
+			else
+				to_sockaddr(&filter->src, any_addr, 0);
+
+			if ((&filter->src)->ss_family == AF_INET) {
+				((struct sockaddr_in *)&filter->mask)->sin_family = AF_INET;
+				((struct sockaddr_in *)&filter->mask)->sin_len =
+				    sizeof(struct sockaddr_in);
+				((struct sockaddr_in *)&filter->mask)->sin_addr.s_addr =
+				    htonl(~((1 << (128 - (&option->data)->filter->prefix)) - 1));
+			} else {
+				((struct sockaddr_in6 *)&filter->mask)->sin6_family = AF_INET6;
+				((struct sockaddr_in6 *)&filter->mask)->sin6_len =
+				    sizeof(struct sockaddr_in6);
+				in6_prefixlen2mask(&((struct sockaddr_in6 *)&filter->mask)->sin6_addr,
+				    (&option->data)->filter->prefix);
+			}
 
 			TAILQ_INSERT_TAIL(&filters, filter, entry);
 
