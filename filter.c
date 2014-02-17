@@ -142,6 +142,8 @@ prepare_rule(u_int8_t proto, struct sockaddr_storage *src,
     struct sockaddr_storage *mask, struct sockaddr *dst)
 {
 	if ((dst->sa_family != AF_INET) ||
+	    (src && !mask) ||
+	    (src && src->ss_family != dst->sa_family) ||
 	    (proto != IPPROTO_UDP && proto != IPPROTO_TCP)) {
 		errno = EPROTONOSUPPORT;
 		return (-1);
@@ -170,6 +172,18 @@ prepare_rule(u_int8_t proto, struct sockaddr_storage *src,
 		pfr.rule.dst.port[0] = ((struct sockaddr_in *)dst)->sin_port;
 	}
 	pfr.rule.dst.port_op = PF_OP_EQ;
+
+	if (src) {
+		if (src->ss_family == AF_INET) {
+			memcpy(&pfr.rule.src.addr.v.a.addr.v4,
+			    &((struct sockaddr_in *)src)->sin_addr.s_addr, 4);
+			memcpy(&pfr.rule.src.addr.v.a.mask.v4,
+			    &((struct sockaddr_in *)mask)->sin_addr.s_addr, 4);
+			pfr.rule.src.port[0] = ((struct sockaddr_in *)src)->sin_port;
+		}
+		if (pfr.rule.src.port[0])
+			pfr.rule.src.port_op = PF_OP_EQ;
+	}
 
 	/*
 	 * pass [quick] [log] inet proto $proto \
