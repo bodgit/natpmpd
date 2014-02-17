@@ -1244,10 +1244,20 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			 * XXX Not quite sure what to return for the latter
 			 */
 			if ((i == nitems(pcp_options) && oh->code < 0x80) ||
-			    !((&pcp_options[i])->valid & (1 << request->opcode))) {
+			    (i < nitems(pcp_options) &&
+			    !((&pcp_options[i])->valid & (1 << request->opcode)))) {
 				log_debug("unsupp option");
 				response->result = PCP_UNSUPP_OPTION;
 				goto send;
+			}
+
+			/* It was an optional and unsupported option, skip to
+			 * the next option
+			 */
+			if (i == nitems(pcp_options)) {
+				log_warnx("ignoring option %d, length %d",
+				    oh->code & 0x7f, ntohs(oh->length));
+				goto option;
 			}
 
 			/* Track how many times we've seen this option,
@@ -1282,6 +1292,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 
 			TAILQ_INSERT_TAIL(&options, option, entry);
 
+option:
 			/* Advance to next option */
 			oh = (struct pcp_option_header *)((u_int8_t *)oh + sizeof(struct pcp_option_header) + optlen);
 		}
