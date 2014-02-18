@@ -167,7 +167,9 @@ __dead void	 usage(void);
 struct mapping	*init_mapping(struct mappings *, struct mapping *);
 void		 free_mapping(struct mapping *);
 void		 expire_mapping(int, short, void *);
-void		 announce_address(int, short, void *);
+void		 announce_handler(int, short, void *);
+void		 natpmp_announce(struct natpmpd *);
+void		 pcp_announce(struct natpmpd *);
 void		 route_handler(int, short, void *);
 void		 common_handler(int, short, void *);
 int		 natpmp_remove_mapping(u_int8_t, struct sockaddr_in *);
@@ -435,20 +437,34 @@ in6_prefixlen2mask(struct in6_addr *maskp, int len)
 }
 
 void
-announce_address(int fd, short event, void *arg)
+announce_handler(int fd, short event, void *arg)
 {
-	struct natpmpd		*env = (struct natpmpd *)arg;
-	u_int8_t		 packet[NATPMPD_MAX_PACKET_SIZE];
+	struct natpmpd	*env = (struct natpmpd *)arg;
+
+	natpmp_announce(env);
+	pcp_announce(env);
+
+	env->sc_delay++;
+
+	/* If we haven't sent 10 announcements yet, queue up another */
+	if (env->sc_delay < NATPMPD_MAX_DELAY)
+		evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
+}
+
+void
+natpmp_announce(struct natpmpd *env)
+{
+	u_int8_t		 packet[NATPMP_MAX_PACKET_SIZE];
 	struct natpmp_response	*r;
 	struct listen_addr	*la;
 
 	/* Create the address announce packet */
-	assert(sizeof(struct natpmp_response) <= NATPMPD_MAX_PACKET_SIZE);
+	assert(sizeof(struct natpmp_response) <= NATPMP_MAX_PACKET_SIZE);
 	r = (struct natpmp_response *)packet;
 	memset(r, 0, sizeof(struct natpmp_response));
 
-	r->version = NATPMPD_MAX_VERSION;
-	r->opcode = 0x80;
+	r->version = NATPMP_MAX_VERSION;
+	r->opcode = NATPMP_OPCODE_ANNOUNCE | 0x80;
 	r->result = NATPMP_SUCCESS;
 	r->sssoe = htonl(sssoe(env));
 	r->data.announce.address =
@@ -463,12 +479,42 @@ announce_address(int fd, short event, void *arg)
 		    (struct sockaddr *)&all_nodes4, sizeof(all_nodes4)) < 0)
 			log_warn("sendto");
 	}
+}
 
-	env->sc_delay++;
+void
+pcp_announce(struct natpmpd *env)
+{
+	u_int8_t		 packet[PCP_MAX_PACKET_SIZE];
+	struct pcp_header	*r = (struct pcp_header *)packet;
+	struct listen_addr	*la;
+	struct sockaddr		*sa;
+	socklen_t		 slen;
 
-	/* If we haven't sent 10 announcements yet, queue up another */
-	if (env->sc_delay < NATPMPD_MAX_DELAY)
-		evtimer_add(&env->sc_announce_ev, &timeouts[env->sc_delay]);
+	memset(r, 0, sizeof(r));
+
+	r->version = PCP_MAX_VERSION;
+	r->opcode = PCP_OPCODE_ANNOUNCE | 0x80;
+	r->result = PCP_SUCCESS;
+	r->lifetime = htonl(0);
+	(&r->data)->sssoe = htonl(sssoe(env));
+	
+	/* Loop through all of our listening addresses and send the packet */
+	for (la = TAILQ_FIRST(&env->listen_addrs); la;
+	    la = TAILQ_NEXT(la, entry)) {
+		if (la->sa.ss_family == AF_INET) {
+			sa = (struct sockaddr *)&all_nodes4;
+			slen = sizeof(struct sockaddr_in);
+		} else {
+			sa = (struct sockaddr *)&all_nodes6;
+			slen = sizeof(struct sockaddr_in6);
+		}
+
+		log_debug("announcing %d to %s", ntohl((&r->data)->sssoe),
+		    log_sockaddr(sa));
+
+		if (sendto(la->fd, packet, sizeof(r), 0, sa, slen) < 0)
+			log_warn("sendto");
+	}
 }
 
 void
@@ -735,7 +781,7 @@ natpmp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 
 	request = (struct natpmp_request *)request_storage;
 	response = (struct natpmp_response *)&response_storage;
-	response->version = NATPMPD_MAX_VERSION;
+	response->version = NATPMP_MAX_VERSION;
 	response->sssoe = htonl(sssoe(env));
 
 	if (request->version > NATPMP_MAX_VERSION) {
@@ -1643,7 +1689,7 @@ main(int argc, char *argv[])
 	(&all_nodes6)->sin6_port = htons(NATPMPD_CLIENT_PORT);
 
 	/* Initialise the packet filter and clear out our anchor */
-	init_filter(NULL, NULL, 0);
+	init_filter(NULL, NULL, debug);
 	/* Perhaps not fail here and instead return the correct
 	 * NATPMP_NOT_AUTHORISED and/or PCP_NOT_AUTHORISED
 	 */
@@ -1766,7 +1812,7 @@ main(int argc, char *argv[])
 	event_set(&rt_ev, rt_fd, EV_READ|EV_PERSIST, route_handler, env);
 	event_add(&rt_ev, NULL);
 
-	evtimer_set(&env->sc_announce_ev, announce_address, env);
+	evtimer_set(&env->sc_announce_ev, announce_handler, env);
 	check_interface(env);
 
 	event_dispatch();
