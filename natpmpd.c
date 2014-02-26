@@ -1281,7 +1281,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 
 			/* Find this option in our supported options */
 			for (i = 0; i < nitems(pcp_options) &&
-			    (oh->code & 0x7f) != (&pcp_options[i])->code; i++);
+			    oh->code != (&pcp_options[i])->code; i++);
 
 			/* We dropped off the end of the list and the option
 			 * is unimplemented and mandatory, or the option is
@@ -1302,7 +1302,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			 */
 			if (i == nitems(pcp_options)) {
 				log_warnx("ignoring option %d, length %d",
-				    oh->code & 0x7f, ntohs(oh->length));
+				    oh->code, ntohs(oh->length));
 				goto option;
 			}
 
@@ -1333,7 +1333,7 @@ pcp_handler(struct natpmpd *env, int fd, u_int8_t *request_storage,
 			option->header = oh;
 			(&option->data)->raw = (optlen) ? (u_int8_t *)oh + sizeof(struct pcp_option_header) : NULL;
 
-			log_debug("option %d, length %d", oh->code & 0x7f,
+			log_debug("option %d, length %d", oh->code,
 			    ntohs(oh->length));
 
 			TAILQ_INSERT_TAIL(&options, option, entry);
