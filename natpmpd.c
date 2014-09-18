@@ -214,9 +214,10 @@ TAILQ_HEAD(, pcp_third_party) third_party = TAILQ_HEAD_INITIALIZER(third_party);
 
 /* Table of supported PCP options */
 struct pcp_option_rule pcp_options[] = {
-	{ PCP_OPTION_THIRD_PARTY,    16, 16, 1, 0x06 },
-	{ PCP_OPTION_PREFER_FAILURE,  0,  0, 1, 0x02 },
-	{ PCP_OPTION_FILTER,         20, 20, 0, 0x02 },
+	{ PCP_OPTION_THIRD_PARTY,    16,   16, 1, 0x06 },
+	{ PCP_OPTION_PREFER_FAILURE,  0,    0, 1, 0x02 },
+	{ PCP_OPTION_FILTER,         20,   20, 0, 0x02 },
+	{ PCP_OPTION_DESCRIPTION,     0, 1016, 1, 0x06 },
 };
 
 struct in6_addr		 all_nodes = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
@@ -1421,6 +1422,8 @@ option:
 
 			TAILQ_INSERT_TAIL(&filters, filter, entry);
 
+			break;
+		case PCP_OPTION_DESCRIPTION:
 			break;
 		default:
 			fatalx("unimplemented option");
